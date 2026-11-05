@@ -76,6 +76,7 @@ COMANDOS_MENU = [
     {"command": "status", "description": "Análise atual e posições abertas"},
     {"command": "pausar", "description": "Pausa os alertas (ex.: /pausar 2h)"},
     {"command": "retomar", "description": "Retoma os alertas"},
+    {"command": "ajuda", "description": "O que significa cada informação"},
 ]
 
 # Avisos de ordens guardados durante a pausa e entregues ao retomar
@@ -974,6 +975,115 @@ def processar_comandos(pasta, client, cfg, notif, cache, ordens):
     return bool(textos)
 
 
+AJUDA = {
+"alertas": """📖 O QUE SIGNIFICA CADA ALERTA
+
+🔔 Pressão na resistência
+O preço está batendo várias vezes num "teto" (resistência). O monitor compara os sinais de que ele vai furar o teto com os sinais de que vai voltar, e dá uma leitura:
+• "rompimento iminente": os sinais apontam para furar o teto
+• "risco de rejeição": os sinais apontam para voltar para baixo
+• "indefinido": empate; vale esperar
+
+🔔 Teste de suporte
+O mesmo, mas no "piso" (suporte): o preço está encostando várias vezes nele.
+• "perda do suporte iminente": pode furar o piso e cair
+• "suporte segurando": os compradores estão defendendo o piso
+
+🔔 Faixa lateral
+O preço está "preso" entre o piso e o teto há um tempo, sem tendência clara. A mensagem mostra o piso, o teto, o meio e onde o preço está (0% = no piso, 100% = no teto).
+
+🔔 Rompimento
+O preço fechou do outro lado de um piso ou teto. "Confirmado por volume" quer dizer que foi com muitos negócios, o que costuma ser mais confiável. "Volume fraco" pede mais cautela.
+
+🔔 Acomodação
+Depois de um rompimento, o preço voltou para "testar" a zona rompida e se manteve do lado novo. É comum o antigo teto virar piso (e vice-versa).
+
+🔔 Falso rompimento
+O preço furou a zona mas voltou. O rompimento não se confirmou.
+
+💼 Variação da carteira
+O valor total da sua carteira subiu ou caiu mais que o limite configurado.
+
+📊 Resumo
+Uma foto de cada moeda: tendência, RSI, piso (S) e teto (R) mais próximos.""",
+
+"termos": """📖 TERMOS USADOS NOS RELATÓRIOS
+
+Suporte (S): região de preço onde ele costuma parar de cair, porque aparecem compradores. Funciona como um "piso".
+
+Resistência (R): região onde ele costuma parar de subir, porque aparecem vendedores. Um "teto".
+
+Zona: o monitor mostra piso e teto como uma faixa de preço (ex.: 80.008–80.764), não como um número exato.
+
+Toques: quantas vezes o preço já virou naquela zona. Mais toques = zona mais forte.
+
+Testes: quantas das últimas velas encostaram na zona.
+
+Vela [1h] / [4h]: cada vela é um período do gráfico. [1h] olha o movimento de hora em hora (curto prazo); [4h] de 4 em 4 horas (prazo um pouco maior). Quando os dois concordam, o sinal é mais forte.
+
+Tendência: alta (subindo de forma consistente), baixa (caindo) ou lateral (sem direção).
+
+RSI: medidor de força de 0 a 100. Acima de 70 = subiu muito rápido ("sobrecomprado"), pode dar uma pausa. Abaixo de 30 = caiu muito rápido ("sobrevendido"), pode repicar. Entre 30 e 70 = normal.
+
+Divergência de RSI: o preço chega no mesmo nível, mas com menos força que antes. Costuma indicar que o movimento está cansando.
+
+Volume: quantidade negociada. "1.9× a média" = quase o dobro do normal.
+
+Pavio: a "linha fina" da vela. Pavio longo em cima = o preço subiu mas foi empurrado de volta (vendedores). Embaixo = compradores defenderam.
+
+Volatilidade comprimida: o preço está se movendo pouco, "acumulando". Muitas vezes vem antes de um movimento forte.
+
+ATR: tamanho médio do movimento de uma vela. O monitor usa para medir o que é "perto" ou "longe" em cada moeda.
+
+Repique: subida curta depois de uma queda.""",
+
+"ordens": """📖 AVISOS DE ORDENS E POSIÇÕES
+
+🆕 Nova ordem/posição: você abriu uma ordem (ou posição em Futuros) e o monitor passou a acompanhar.
+
+🎯 Preço alcançado: o mercado chegou no preço da sua ordem, mas ela ainda não foi executada (pode faltar quem negocie do outro lado).
+
+🟡 Execução parcial: só uma parte da quantidade foi negociada.
+
+✅ Ordem executada: a ordem foi negociada por completo. Mostra o preço médio que você pagou ou recebeu.
+
+❌ Encerrada sem execução: a ordem foi cancelada, expirou ou foi recusada.
+
+🏁 Posição encerrada: uma posição em Futuros foi fechada.
+
+📋 Relatório (a cada 5 min enquanto houver algo aberto):
+• "falta X% até a ordem": quanto o preço ainda precisa andar para chegar na sua ordem
+• Spot: compra e venda da própria moeda
+• Futuros LONG: aposta na alta; SHORT: aposta na queda
+• Entrada: preço em que a posição foi aberta
+• Marca: preço de referência atual
+• PnL: lucro (+) ou prejuízo (−) ainda não realizado
+• Liquidação: preço em que a corretora fecha a posição à força. Fique longe dele!
+
+Tipos de ordem:
+• LIMIT: compra/vende num preço definido
+• STOP_LOSS: vende/compra quando o preço passa de um ponto, para limitar perdas
+• TAKE_PROFIT: realiza o lucro quando chega no alvo""",
+
+"comandos": """📖 COMANDOS
+
+/status: análise atual de cada moeda e suas ordens/posições abertas
+/pausar: para de enviar alertas até você mandar /retomar
+/pausar 30m, /pausar 2h, /pausar 1d: pausa por um tempo e volta sozinho
+/retomar: volta a enviar e entrega os avisos de ordens guardados na pausa
+/ajuda: esta explicação completa
+/ajuda alertas, /ajuda termos, /ajuda ordens, /ajuda comandos: só uma parte
+
+Durante a pausa o monitor continua acompanhando tudo. Avisos de execução de ordens nunca se perdem: ficam guardados e chegam quando você retomar.
+
+⚠️ O monitor identifica padrões, não prevê o futuro e não é recomendação de compra ou venda.""",
+}
+ORDEM_AJUDA = ["alertas", "termos", "ordens", "comandos"]
+SINONIMOS_AJUDA = {"alerta": "alertas", "termo": "termos", "glossario": "termos",
+                   "glossário": "termos", "ordem": "ordens", "posicoes": "ordens",
+                   "posições": "ordens", "comando": "comandos"}
+
+
 def executar_comando(texto, client, cfg, notif, cache, ordens):
     partes = texto.lstrip("/").split(maxsplit=1)
     cmd = partes[0].lower().split("@")[0] if partes else ""
@@ -994,8 +1104,12 @@ def executar_comando(texto, client, cfg, notif, cache, ordens):
         except Exception as e:
             log.exception("Erro no /status")
             notif.enviar(f"⚠️ Erro ao montar o status: {type(e).__name__}", forcar=True)
+    elif cmd in ("ajuda", "help", "start"):
+        tema = SINONIMOS_AJUDA.get(arg.strip().lower(), arg.strip().lower())
+        for t in ([tema] if tema in AJUDA else ORDEM_AJUDA):
+            notif.enviar(AJUDA[t], forcar=True)
     else:
-        notif.enviar("Comandos do monitor: /status, /pausar [30m|2h|1d], /retomar",
+        notif.enviar("Comandos do monitor: /status, /pausar [30m|2h|1d], /retomar, /ajuda",
                      forcar=True)
 
 

@@ -50,6 +50,7 @@ notebook, um Raspberry Pi ou uma máquina virtual) como serviço do `systemd`. �
 | `/status` | Mostra na hora a análise atual e as ordens ou posições abertas. |
 | `/pausar` | Pausa os alertas até você mandar `/retomar`. Aceita prazo: `/pausar 30m`, `/pausar 2h`, `/pausar 1d`. |
 | `/retomar` | Volta a enviar os alertas e entrega os avisos de ordens que ficaram guardados durante a pausa. |
+| `/ajuda` | Explica em linguagem simples cada alerta, cada termo dos relatórios (suporte, RSI, ATR, pavio…), os avisos de ordens e os comandos. Para ver só uma parte: `/ajuda alertas`, `/ajuda termos`, `/ajuda ordens` ou `/ajuda comandos`. |
 
 O monitor só aceita comandos vindos do `TELEGRAM_CHAT_ID` configurado e ignora
 qualquer outro chat. Durante a pausa ele continua acompanhando tudo: os alertas
