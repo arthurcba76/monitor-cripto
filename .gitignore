@@ -1,0 +1,14 @@
+# Credenciais e dados locais: nunca versionar
+.env
+.env.*
+!.env.exemplo
+config.json
+estado.json
+estado.tmp
+monitor.log*
+comandos/
+
+# Python
+.venv/
+__pycache__/
+*.pyc

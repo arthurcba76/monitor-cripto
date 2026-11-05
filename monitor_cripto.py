@@ -1,0 +1,1096 @@
+#!/usr/bin/env python3
+"""
+monitor_cripto.py — Monitor de carteira na Binance com detecção de
+suporte/resistência e alertas (console, log e Telegram).
+
+O programa NÃO faz previsão nem recomendação de investimento: ele identifica
+padrões técnicos conhecidos (zonas de suporte/resistência, pressão sobre a
+zona, compressão de volatilidade, faixa lateral, rompimento, reteste/acomodação
+e falso rompimento) e avisa quando eles aparecem.
+
+Projeto: monitor-cripto (licença MIT). Configuração em config.json e .env.
+
+Uso:
+  python3 monitor_cripto.py            # roda em loop contínuo
+  python3 monitor_cripto.py --once     # um ciclo e sai (bom para testar)
+  python3 monitor_cripto.py --demo     # simulação offline, sem Binance
+"""
+import argparse
+import hashlib
+import hmac
+import json
+import logging
+import math
+import os
+import random
+import sys
+import time
+from logging.handlers import RotatingFileHandler
+from dataclasses import dataclass, field
+from pathlib import Path
+from urllib.parse import urlencode
+
+try:
+    import requests
+except ImportError:  # pragma: no cover
+    sys.exit("Falta a dependência 'requests': pip install requests")
+
+BASE_URL = "https://api.binance.com"
+FAPI_URL = "https://fapi.binance.com"   # Futuros USDⓈ-M
+APP_DIR = Path(__file__).resolve().parent
+STABLES = {"USDT", "USDC", "FDUSD", "BUSD", "TUSD", "DAI"}
+log = logging.getLogger("monitor")
+
+DEFAULT_CONFIG = {
+    "moeda_cotacao": "USDT",
+    "usar_carteira": True,            # lê saldos da conta (chave SOMENTE LEITURA)
+    "simbolos_extras": ["BTCUSDT"],   # pares monitorados mesmo sem saldo
+    "valor_minimo_cotacao": 10,       # ignora saldos menores que isso (poeira)
+    "intervalos": ["1h", "4h"],
+    "velas": 500,
+    "intervalo_verificacao_s": 60,
+    "pivo_janela": 5,                 # velas de cada lado para um topo/fundo valer
+    "min_toques": 2,                  # toques mínimos para uma zona valer
+    "tolerancia_zona_atr": 0.6,       # pivôs a menos de X ATR viram a mesma zona
+    "proximidade_atr": 0.5,           # "perto da zona" = a menos de X ATR
+    "rompimento_atr": 0.25,           # fechamento X ATR além da zona = rompimento
+    "volume_rompimento": 1.3,         # volume da vela ≥ X × média = confirmado
+    "faixa_min_atr": 2.0,
+    "faixa_max_atr": 10.0,
+    "compressao_limite": 0.75,        # ATR curto/longo abaixo disso = compressão
+    "validade_rompimento_velas": 30,  # por quantas velas acompanhar o reteste
+    "variacao_carteira_pct": 3.0,     # alerta se o total da carteira mudar X%
+    "cooldown_min": 240,              # não repete o mesmo alerta antes disso
+    "resumo_horas": 12,               # resumo periódico no Telegram (0 desliga)
+    "monitorar_ordens": True,         # ordens abertas no Spot (e Futuros, se houver)
+    "monitorar_futuros": True,        # desliga sozinho se a chave não tiver acesso
+    "intervalo_ordens_s": 15,         # checagem de execução de ordens
+    "relatorio_ordens_min": 5,        # relatório enquanto houver ordem/posição aberta
+    "comandos_telegram": True,        # o próprio monitor lê /status, /pausar, /retomar
+                                      # (use false se o bot já é lido por outro programa)
+    "pasta_comandos": "",             # alternativa: outro programa grava *.cmd aqui;
+                                      # vazio = ./comandos
+}
+
+COMANDOS_MENU = [
+    {"command": "status", "description": "Análise atual e posições abertas"},
+    {"command": "pausar", "description": "Pausa os alertas (ex.: /pausar 2h)"},
+    {"command": "retomar", "description": "Retoma os alertas"},
+]
+
+# Avisos de ordens guardados durante a pausa e entregues ao retomar
+CRITICOS = ("✅", "❌", "🟡", "🎯", "🏁", "🆕", "⚠️")
+
+
+# --------------------------------------------------------------------------
+# Configuração e ambiente
+# --------------------------------------------------------------------------
+def load_env(path: Path):
+    if not path.exists():
+        return
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+
+def load_config(path: Path) -> dict:
+    cfg = dict(DEFAULT_CONFIG)
+    if path.exists():
+        cfg.update(json.loads(path.read_text()))
+    return cfg
+
+
+def load_state(path: Path) -> dict:
+    if path.exists():
+        try:
+            return json.loads(path.read_text())
+        except json.JSONDecodeError:
+            log.warning("estado.json corrompido; recomeçando do zero")
+    return {}
+
+
+def save_state(path: Path, state: dict):
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=1))
+    tmp.replace(path)
+
+
+# --------------------------------------------------------------------------
+# Cliente Binance (somente leitura)
+# --------------------------------------------------------------------------
+@dataclass
+class Candle:
+    t: int      # abertura (ms)
+    o: float
+    h: float
+    l: float
+    c: float
+    v: float
+    ct: int     # fechamento (ms)
+
+
+class BinanceErro(Exception):
+    pass
+
+
+DICAS_ERRO = {
+    -2015: "chave inválida, IP fora da restrição ou chave sem 'Enable Reading'",
+    -2014: "formato da chave inválido (colagem incompleta?)",
+    -1022: "assinatura inválida: confira o BINANCE_API_SECRET",
+    -1021: "relógio do servidor fora de sincronia (rode: timedatectl)",
+}
+
+
+class Binance:
+    def __init__(self, key=None, secret=None):
+        self.s = requests.Session()
+        self.key, self.secret = key, secret
+        if key:
+            self.s.headers["X-MBX-APIKEY"] = key
+
+    def get(self, path, params=None, signed=False, base=BASE_URL):
+        for tentativa in range(4):
+            p = dict(params or {})
+            if signed:
+                p["timestamp"] = int(time.time() * 1000)
+                p["recvWindow"] = 10000
+                q = urlencode(p)
+                p["signature"] = hmac.new(self.secret.encode(), q.encode(),
+                                          hashlib.sha256).hexdigest()
+            try:
+                r = self.s.get(base + path, params=p, timeout=15)
+                if r.status_code in (418, 429):
+                    espera = int(r.headers.get("Retry-After", 60))
+                    log.warning("Limite da API atingido; aguardando %ss", espera)
+                    time.sleep(espera)
+                    continue
+                if 400 <= r.status_code < 500:
+                    # erro do cliente (chave, IP, assinatura): não adianta repetir
+                    try:
+                        d = r.json()
+                        msg = f"Binance {r.status_code} código {d.get('code')}: {d.get('msg')}"
+                    except ValueError:
+                        msg = f"Binance {r.status_code}: {r.text[:200]}"
+                    raise BinanceErro(msg)
+                r.raise_for_status()
+                return r.json()
+            except requests.RequestException as e:
+                if tentativa == 3:
+                    raise
+                log.warning("Erro na API (%s); nova tentativa", e)
+                time.sleep(3 * (tentativa + 1))
+
+    def valid_symbols(self, quote):
+        info = self.get("/api/v3/exchangeInfo", {"permissions": "SPOT"})
+        return {s["symbol"] for s in info["symbols"]
+                if s["status"] == "TRADING" and s["quoteAsset"] == quote}
+
+    def prices(self):
+        return {d["symbol"]: float(d["price"]) for d in self.get("/api/v3/ticker/price")}
+
+    def change24(self, symbols):
+        if not symbols:
+            return {}
+        data = self.get("/api/v3/ticker/24hr", {
+            "symbols": json.dumps(sorted(symbols), separators=(",", ":"))})
+        return {d["symbol"]: float(d["priceChangePercent"]) for d in data}
+
+    def klines(self, symbol, interval, limit):
+        raw = self.get("/api/v3/klines",
+                       {"symbol": symbol, "interval": interval, "limit": limit})
+        cs = [Candle(int(k[0]), float(k[1]), float(k[2]), float(k[3]),
+                     float(k[4]), float(k[5]), int(k[6])) for k in raw]
+        agora = int(time.time() * 1000)
+        if cs and cs[-1].ct > agora:   # vela ainda em formação: fora da análise
+            cs.pop()
+        return cs
+
+    def balances(self):
+        acc = self.get("/api/v3/account", {"omitZeroBalances": "true"}, signed=True)
+        out = {}
+        for b in acc["balances"]:
+            q = float(b["free"]) + float(b["locked"])
+            if q > 0:
+                out[b["asset"]] = out.get(b["asset"], 0) + q
+        return out
+
+
+# --------------------------------------------------------------------------
+# Indicadores
+# --------------------------------------------------------------------------
+def ema(vals, n):
+    k, out, e = 2 / (n + 1), [], vals[0]
+    for v in vals:
+        e = v * k + e * (1 - k)
+        out.append(e)
+    return out
+
+
+def true_ranges(cs):
+    tr = [cs[0].h - cs[0].l]
+    for i in range(1, len(cs)):
+        p = cs[i - 1].c
+        tr.append(max(cs[i].h - cs[i].l, abs(cs[i].h - p), abs(cs[i].l - p)))
+    return tr
+
+
+def wilder(vals, n):
+    out, a = [], sum(vals[:n]) / n
+    for i, v in enumerate(vals):
+        if i >= n:
+            a = (a * (n - 1) + v) / n
+        out.append(a)
+    return out
+
+
+def rsi(closes, n=14):
+    g = [0.0] + [max(closes[i] - closes[i - 1], 0) for i in range(1, len(closes))]
+    p = [0.0] + [max(closes[i - 1] - closes[i], 0) for i in range(1, len(closes))]
+    ag, ap = wilder(g, n), wilder(p, n)
+    return [100.0 if b == 0 else 100 - 100 / (1 + a / b) for a, b in zip(ag, ap)]
+
+
+def slope(vals):
+    """Inclinação da regressão linear (por vela)."""
+    n = len(vals)
+    mx, my = (n - 1) / 2, sum(vals) / n
+    num = sum((i - mx) * (v - my) for i, v in enumerate(vals))
+    den = sum((i - mx) ** 2 for i in range(n)) or 1
+    return num / den
+
+
+def mean(x):
+    return sum(x) / len(x) if x else 0.0
+
+
+# --------------------------------------------------------------------------
+# Zonas de suporte e resistência
+# --------------------------------------------------------------------------
+@dataclass
+class Zona:
+    low: float
+    high: float
+    toques: int
+    ultimo: int                       # índice da vela do toque mais recente
+    tipos: set = field(default_factory=set)   # 'R' (topos) e/ou 'S' (fundos)
+
+    @property
+    def mid(self):
+        return (self.low + self.high) / 2
+
+
+def pivots(cs, k):
+    topos, fundos = [], []
+    for i in range(k, len(cs) - k):
+        jan = cs[i - k:i + k + 1]
+        if cs[i].h == max(c.h for c in jan):
+            topos.append((i, cs[i].h))
+        if cs[i].l == min(c.l for c in jan):
+            fundos.append((i, cs[i].l))
+    return topos, fundos
+
+
+def build_zones(topos, fundos, atr, cfg):
+    pts = sorted([(p, i, "R") for i, p in topos] + [(p, i, "S") for i, p in fundos])
+    tol = cfg["tolerancia_zona_atr"] * atr
+    clusters, atual = [], []
+    for pt in pts:
+        if atual and pt[0] - mean([x[0] for x in atual]) > tol:
+            clusters.append(atual)
+            atual = []
+        atual.append(pt)
+    if atual:
+        clusters.append(atual)
+    pad = 0.15 * atr
+    zonas = []
+    for cl in clusters:
+        if len(cl) < cfg["min_toques"]:
+            continue
+        precos = [x[0] for x in cl]
+        zonas.append(Zona(min(precos) - pad, max(precos) + pad, len(cl),
+                          max(x[1] for x in cl), {x[2] for x in cl}))
+    return zonas
+
+
+# --------------------------------------------------------------------------
+# Análise de um par/intervalo
+# --------------------------------------------------------------------------
+def fmt(p):
+    if p >= 1000:
+        return f"{p:,.0f}".replace(",", ".")
+    if p >= 1:
+        return f"{p:.2f}".replace(".", ",")
+    casas = max(4, -int(math.floor(math.log10(p))) + 3)
+    return f"{p:.{casas}f}".replace(".", ",")
+
+
+def zid(preco):
+    """Identificador estável de zona (grade de ~0,5%), imune a pequenas mudanças de borda."""
+    return str(round(math.log(preco) / 0.005))
+
+
+def zona_txt(z):
+    return f"{fmt(z.low)}–{fmt(z.high)} ({z.toques} toques)"
+
+
+@dataclass
+class Sinal:
+    chave: str
+    titulo: str
+    linhas: list
+
+
+def analyze(cs, price, cfg, st):
+    """Retorna (resumo, [Sinal]). `st` é o estado persistente deste par/intervalo."""
+    if len(cs) < 80:
+        return None, []
+    C = [c.c for c in cs]
+    V = [c.v for c in cs]
+    tr = true_ranges(cs)
+    A = wilder(tr, 14)[-1]
+    if A <= 0:
+        return None, []
+    comp = mean(tr[-5:]) / (mean(tr[-30:]) or A)
+    e20, e50 = ema(C, 20), ema(C, 50)
+    R = rsi(C, 14)
+    incl = (e50[-1] - e50[-11]) / A
+    if C[-1] > e20[-1] > e50[-1] and incl > 0.3:
+        tendencia = "alta"
+    elif C[-1] < e20[-1] < e50[-1] and incl < -0.3:
+        tendencia = "baixa"
+    else:
+        tendencia = "lateral"
+
+    topos, fundos = pivots(cs, cfg["pivo_janela"])
+    zonas = build_zones(topos, fundos, A, cfg)
+    res = min((z for z in zonas if z.mid > price), key=lambda z: z.mid, default=None)
+    sup = max((z for z in zonas if z.mid <= price), key=lambda z: z.mid, default=None)
+    vol_med = mean(V[-21:-1]) or 1
+    vol_rec = mean(V[-5:]) / vol_med
+    prox = cfg["proximidade_atr"]
+    base = [f"Preço: {fmt(price)} | tendência: {tendencia} | RSI {R[-1]:.0f}"]
+    sinais = []
+
+    resumo = {"tendencia": tendencia, "rsi": round(R[-1]),
+              "suporte": zona_txt(sup) if sup else "—",
+              "resistencia": zona_txt(res) if res else "—"}
+
+    # 1) Pressão sobre a resistência --------------------------------------
+    if res and (res.low - price) / A <= prox and price <= res.high + 0.1 * A:
+        testes = [c for c in cs[-12:] if c.h >= res.low - 0.1 * A]
+        if len(testes) >= 2:
+            pro, contra = [], []
+            if comp < cfg["compressao_limite"]:
+                pro.append("volatilidade comprimida")
+            if slope([c.l for c in cs[-12:]]) / A > 0.03:
+                pro.append("fundos ascendentes (compressão contra a zona)")
+            if vol_rec > 1.2:
+                pro.append("volume crescente")
+            if tendencia == "alta":
+                pro.append("tendência de alta")
+            pavios = sum(1 for c in testes if c.h > c.l and
+                         (c.h - max(c.o, c.c)) / (c.h - c.l) > 0.5)
+            if pavios >= 2:
+                contra.append(f"{pavios} pavios de rejeição")
+            if R[-1] > 70:
+                contra.append("RSI sobrecomprado")
+            if tendencia == "baixa":
+                contra.append("tendência de baixa")
+            if cs[-1].h >= cs[res.ultimo].h - 0.1 * A and res.ultimo < len(cs) - 3 \
+                    and R[-1] < R[res.ultimo] - 5:
+                contra.append("divergência de RSI (força menor no novo teste)")
+            if len(pro) >= 3 and len(pro) > len(contra):
+                leitura = "rompimento para cima parece iminente"
+            elif len(contra) > len(pro):
+                leitura = "risco de rejeição — possível volta para dentro da faixa"
+            else:
+                leitura = "indefinido — esperar o fechamento confirmar"
+            sinais.append(Sinal(
+                f"pressaoR:{zid(res.mid)}:{leitura[:10]}",
+                "Pressão na resistência",
+                base + [f"Resistência: {zona_txt(res)} — {len(testes)} testes nas últimas 12 velas",
+                        "A favor do rompimento: " + (", ".join(pro) or "nada"),
+                        "Contra: " + (", ".join(contra) or "nada"),
+                        f"Leitura: {leitura}"]))
+
+    # 2) Teste de suporte ---------------------------------------------------
+    if sup and (price - sup.high) / A <= prox and price >= sup.low - 0.1 * A:
+        testes = [c for c in cs[-12:] if c.l <= sup.high + 0.1 * A]
+        if len(testes) >= 2:
+            queda, segura = [], []
+            if comp < cfg["compressao_limite"]:
+                queda.append("volatilidade comprimida")
+            if slope([c.h for c in cs[-12:]]) / A < -0.03:
+                queda.append("topos descendentes (pressão sobre o suporte)")
+            if vol_rec > 1.2 and C[-1] < C[-6]:
+                queda.append("volume crescente na descida")
+            if tendencia == "baixa":
+                queda.append("tendência de baixa")
+            pavios = sum(1 for c in testes if c.h > c.l and
+                         (min(c.o, c.c) - c.l) / (c.h - c.l) > 0.5)
+            if pavios >= 2:
+                segura.append(f"{pavios} pavios de defesa (compradores)")
+            if R[-1] < 30:
+                segura.append("RSI sobrevendido")
+            if tendencia == "alta":
+                segura.append("tendência de alta")
+            if cs[-1].l <= cs[sup.ultimo].l + 0.1 * A and sup.ultimo < len(cs) - 3 \
+                    and R[-1] > R[sup.ultimo] + 5:
+                segura.append("divergência de RSI (venda perdendo força)")
+            if len(queda) >= 3 and len(queda) > len(segura):
+                leitura = "rompimento para baixo parece iminente"
+            elif len(segura) > len(queda):
+                leitura = "suporte segurando — possível repique"
+            else:
+                leitura = "indefinido — esperar o fechamento confirmar"
+            sinais.append(Sinal(
+                f"testeS:{zid(sup.mid)}:{leitura[:10]}",
+                "Teste de suporte",
+                base + [f"Suporte: {zona_txt(sup)} — {len(testes)} testes nas últimas 12 velas",
+                        "A favor da perda do suporte: " + (", ".join(queda) or "nada"),
+                        "A favor de segurar: " + (", ".join(segura) or "nada"),
+                        f"Leitura: {leitura}"]))
+
+    # 3) Faixa estável entre suporte e resistência --------------------------
+    if res and sup:
+        largura = (res.low - sup.high) / A
+        if cfg["faixa_min_atr"] <= largura <= cfg["faixa_max_atr"] and all(
+                sup.low - 0.3 * A <= c.c <= res.high + 0.3 * A for c in cs[-20:]):
+            pos = (price - sup.high) / (res.low - sup.high) * 100
+            pos = max(0, min(100, pos))
+            meio = (sup.high + res.low) / 2
+            sinais.append(Sinal(
+                f"faixa:{zid(sup.mid)}-{zid(res.mid)}",
+                "Faixa lateral (zona estável)",
+                base + [f"Preço oscilando entre {fmt(sup.high)} e {fmt(res.low)} há 20+ velas",
+                        f"Meio da faixa: {fmt(meio)} | posição atual: {pos:.0f}% da faixa",
+                        "Perto do piso = região de suporte; perto do teto = região de resistência"]))
+
+    # 4) Rompimentos na última vela fechada ----------------------------------
+    st.setdefault("rompimentos", {})
+    ult, ant = cs[-1], cs[-2]
+    b = cfg["rompimento_atr"] * A
+    vol_ult = V[-1] / vol_med
+    for z in zonas:
+        direcao = None
+        # só a PRIMEIRA vela que fecha além da zona conta como rompimento
+        # e o preço precisa vir do outro lado da zona (senão é só um repique nela)
+        antes = cs[-11:-1]
+        if ult.c > z.high + b and ant.c <= z.high + b \
+                and sum(c.c < z.mid for c in antes) >= 6:
+            direcao = "alta"
+        elif ult.c < z.low - b and ant.c >= z.low - b \
+                and sum(c.c > z.mid for c in antes) >= 6:
+            direcao = "baixa"
+        if not direcao:
+            continue
+        # mesma zona (bordas que se sobrepõem) já registrada nesse sentido? ignora
+        if any(bo["dir"] == direcao and bo["low"] <= z.high and z.low <= bo["high"]
+               for bo in st["rompimentos"].values()):
+            continue
+        chave = f"{direcao}:{zid(z.mid)}:{ult.t}"
+        conf = vol_ult >= cfg["volume_rompimento"]
+        st["rompimentos"][chave] = {"dir": direcao, "low": z.low, "high": z.high,
+                                    "t": ult.t, "acomodou": False}
+        if direcao == "alta":
+            prox_z = min((y for y in zonas if y.low > ult.c), key=lambda y: y.low, default=None)
+            alvo = f"Próxima resistência: {zona_txt(prox_z)}" if prox_z else "Sem resistência mapeada acima"
+            papel = "antiga resistência tende a virar suporte"
+        else:
+            prox_z = max((y for y in zonas if y.high < ult.c), key=lambda y: y.high, default=None)
+            alvo = f"Próximo suporte: {zona_txt(prox_z)}" if prox_z else "Sem suporte mapeado abaixo"
+            papel = "antigo suporte tende a virar resistência"
+        sinais.append(Sinal(
+            f"romp:{chave}",
+            f"Rompimento de {direcao} {'CONFIRMADO por volume' if conf else '(volume fraco)'}",
+            base + [f"Fechou fora da zona {zona_txt(z)} — volume {vol_ult:.1f}× a média",
+                    f"Zona provável de acomodação (reteste): {fmt(z.low)}–{fmt(z.high)} — {papel}",
+                    alvo]))
+
+    # 5) Acompanhamento: reteste/acomodação ou falso rompimento --------------
+    validade = cfg["validade_rompimento_velas"]
+    for chave, bo in list(st["rompimentos"].items()):
+        depois = [c for c in cs if c.t > bo["t"]]
+        if len(depois) > validade or (not depois and cs[0].t > bo["t"]):
+            del st["rompimentos"][chave]
+            continue
+        if not depois:
+            continue
+        lc = depois[-1]
+        alta = bo["dir"] == "alta"
+        if (alta and lc.c < bo["low"] - 0.1 * A) or (not alta and lc.c > bo["high"] + 0.1 * A):
+            sinais.append(Sinal(
+                f"falso:{chave}", f"Falso rompimento de {bo['dir']}",
+                base + [f"Preço voltou para dentro/abaixo da zona {fmt(bo['low'])}–{fmt(bo['high'])}",
+                        "O rompimento não se sustentou; a zona volta a valer como antes"]))
+            del st["rompimentos"][chave]
+            continue
+        if bo["acomodou"]:
+            continue
+        if alta:
+            tocou = any(c.l <= bo["high"] + 0.3 * A for c in depois)
+            segurou = lc.c > bo["high"] and lc.c > lc.o
+        else:
+            tocou = any(c.h >= bo["low"] - 0.3 * A for c in depois)
+            segurou = lc.c < bo["low"] and lc.c < lc.o
+        if tocou and segurou:
+            bo["acomodou"] = True
+            sinais.append(Sinal(
+                f"acomod:{chave}", f"Acomodação após rompimento de {bo['dir']}",
+                base + [f"Preço retestou {fmt(bo['low'])}–{fmt(bo['high'])} e "
+                        f"{'segurou acima' if alta else 'foi rejeitado abaixo'}",
+                        "Nova posição de acomodação: a zona rompida passou a funcionar "
+                        f"como {'suporte' if alta else 'resistência'}"]))
+
+    return resumo, sinais
+
+
+# --------------------------------------------------------------------------
+# Alertas
+# --------------------------------------------------------------------------
+class Notificador:
+    def __init__(self, cfg, state):
+        self.token = os.environ.get("TELEGRAM_TOKEN")
+        self.chat = os.environ.get("TELEGRAM_CHAT_ID")
+        self.cooldown = cfg["cooldown_min"] * 60
+        self.enviados = state.setdefault("enviados", {})
+        self.state = state
+        self.ler_comandos = cfg["comandos_telegram"] and bool(self.token and self.chat)
+
+    # ---- comandos recebidos pelo próprio bot ------------------------------
+    def _api(self, metodo, **dados):
+        r = requests.post(f"https://api.telegram.org/bot{self.token}/{metodo}",
+                          json=dados, timeout=15)
+        return r.json()
+
+    def registrar_menu(self):
+        if not self.ler_comandos:
+            return
+        try:
+            atuais = self._api("getMyCommands").get("result", [])
+            nomes = {c["command"] for c in atuais}
+            novos = atuais + [c for c in COMANDOS_MENU if c["command"] not in nomes]
+            if len(novos) != len(atuais):
+                self._api("setMyCommands", commands=novos)
+        except (requests.RequestException, ValueError) as e:
+            log.warning("Não consegui registrar o menu do bot: %s", type(e).__name__)
+
+    def buscar_comandos(self):
+        """Lê mensagens novas do bot (getUpdates). Só aceita o TELEGRAM_CHAT_ID."""
+        if not self.ler_comandos:
+            return []
+        try:
+            d = self._api("getUpdates", offset=self.state.get("tg_offset", 0),
+                          timeout=0, allowed_updates=["message"])
+        except (requests.RequestException, ValueError) as e:
+            log.warning("Falha ao ler comandos do Telegram: %s", type(e).__name__)
+            return []
+        if not d.get("ok"):
+            if d.get("error_code") == 409:
+                self.ler_comandos = False
+                log.warning("Outro programa já lê este bot (409). Comandos pelo Telegram "
+                            "desligados; use 'pasta_comandos' (veja docs/comandos-externos.md).")
+            return []
+        textos = []
+        for u in d.get("result", []):
+            self.state["tg_offset"] = u["update_id"] + 1
+            m = u.get("message") or {}
+            if str(m.get("chat", {}).get("id")) != str(self.chat):
+                continue                      # ignora qualquer outro chat
+            if time.time() - m.get("date", 0) > 120:
+                continue                      # comando antigo (monitor estava parado)
+            txt = (m.get("text") or "").strip()
+            if txt.startswith("/"):
+                textos.append(txt)
+        return textos
+
+    # ---- pausa ----------------------------------------------------------
+    def pausado(self):
+        pz = self.state.get("pausa")
+        if pz and pz.get("ate") and time.time() >= pz["ate"]:
+            self.retomar(auto=True)
+            return False
+        return bool(pz)
+
+    def pausar(self, segundos=0):
+        agora = time.time()
+        pz = self.state.get("pausa") or {"inicio": agora, "suprimidos": 0, "fila": []}
+        pz["ate"] = agora + segundos if segundos else 0
+        self.state["pausa"] = pz
+        ate = (" até " + time.strftime("%d/%m %H:%M", time.localtime(pz["ate"]))) if segundos \
+            else " até você mandar /retomar"
+        self.enviar(f"⏸️ Alertas pausados{ate}.\n"
+                    "Continuo acompanhando o mercado e as ordens; avisos de execução "
+                    "ficam guardados e chegam quando retomar.", forcar=True)
+
+    def retomar(self, auto=False):
+        pz = self.state.pop("pausa", None)
+        if not pz:
+            self.enviar("▶️ Os alertas já estão ativos.", forcar=True)
+            return
+        dur = int((time.time() - pz["inicio"]) / 60)
+        txt = (f"▶️ Alertas retomados{' (fim do prazo da pausa)' if auto else ''}. "
+               f"Pausa de {dur // 60}h{dur % 60:02d}min; "
+               f"{pz['suprimidos']} alerta(s) de mercado não enviados.")
+        if pz["fila"]:
+            txt += "\n\nAvisos de ordens durante a pausa:\n\n" + "\n\n".join(pz["fila"])
+        self.enviar(txt, forcar=True)
+
+    def pode(self, chave):
+        agora = time.time()
+        # limpa chaves velhas para o estado não crescer sem fim
+        for k in [k for k, t in self.enviados.items() if agora - t > 7 * 86400]:
+            del self.enviados[k]
+        if agora - self.enviados.get(chave, 0) < self.cooldown:
+            return False
+        self.enviados[chave] = agora
+        return True
+
+    def enviar(self, texto, forcar=False):
+        if not forcar and self.pausado():
+            pz = self.state["pausa"]
+            if texto.startswith(CRITICOS):
+                pz["fila"] = (pz["fila"] + [time.strftime("%d/%m %H:%M ") + texto])[-20:]
+            else:
+                pz["suprimidos"] += 1
+            log.info("PAUSADO (não enviado)\n%s", texto)
+            return
+        log.info("ALERTA\n%s", texto)
+        if not (self.token and self.chat):
+            return
+        if len(texto) > 4000:                       # limite do Telegram: 4096
+            texto = texto[:3990] + "\n[…]"
+        try:
+            r = requests.post(f"https://api.telegram.org/bot{self.token}/sendMessage",
+                              json={"chat_id": self.chat, "text": texto,
+                                    "disable_web_page_preview": True}, timeout=15)
+            d = r.json()
+            if not d.get("ok"):
+                log.error("Telegram recusou a mensagem: %s %s",
+                          d.get("error_code"), d.get("description"))
+        except (requests.RequestException, ValueError) as e:
+            # str(e) pode conter a URL com o token: registra só o tipo do erro
+            log.error("Falha ao enviar ao Telegram: %s", type(e).__name__)
+
+
+# --------------------------------------------------------------------------
+# Ciclo principal
+# --------------------------------------------------------------------------
+def carteira(client, cfg, validos, precos):
+    quote = cfg["moeda_cotacao"]
+    saldos = client.balances()
+    posicoes, caixa = {}, 0.0
+    for ativo, qtd in saldos.items():
+        if ativo.startswith("LD") and ativo[2:] + quote in validos:  # Earn flexível
+            ativo = ativo[2:]
+        if ativo == quote or ativo in STABLES:
+            caixa += qtd
+            continue
+        sym = ativo + quote
+        if sym in validos and sym in precos:
+            posicoes[sym] = posicoes.get(sym, 0) + qtd
+    posicoes = {s: q for s, q in posicoes.items()
+                if q * precos[s] >= cfg["valor_minimo_cotacao"]}
+    return posicoes, caixa
+
+
+def ciclo(client, cfg, state, notif, cache):
+    quote = cfg["moeda_cotacao"]
+    precos = client.prices()
+    agora = time.time()
+
+    if cfg["usar_carteira"] and client.secret and agora - cache.get("cart_t", 0) > 600:
+        cache["cart_t"] = agora
+        try:
+            cache["posicoes"], cache["caixa"] = carteira(client, cfg, cache["validos"], precos)
+        except BinanceErro as e:
+            # segue monitorando os simbolos_extras mesmo sem acesso à carteira
+            codigo = next((c for c in DICAS_ERRO if f"código {c}:" in str(e)), None)
+            dica = DICAS_ERRO.get(codigo, "confira a chave no painel da Binance")
+            log.error("Falha ao ler a carteira: %s", e)
+            if notif.pode("erro_carteira"):
+                notif.enviar(f"⚠️ Não consegui ler a carteira na Binance\n{e}\n"
+                             f"Provável causa: {dica}\n"
+                             "Continuo monitorando só os pares de 'simbolos_extras'.")
+    posicoes = cache.get("posicoes", {})
+    simbolos = sorted((set(posicoes) | set(cfg["simbolos_extras"]) |
+                       cache.get("simbolos_ordens", set())) & cache["validos"])
+
+    # Variação da carteira como um todo
+    if posicoes:
+        total = sum(q * precos[s] for s, q in posicoes.items()) + cache.get("caixa", 0)
+        ref = state.get("carteira_ref") or total
+        state.setdefault("carteira_ref", total)
+        var = (total / ref - 1) * 100
+        if abs(var) >= cfg["variacao_carteira_pct"]:
+            ch = client.change24(list(posicoes))
+            movers = sorted(ch.items(), key=lambda kv: abs(kv[1]), reverse=True)[:5]
+            notif.enviar("💼 Carteira " + ("subiu" if var > 0 else "caiu") +
+                         f" {var:+.1f}% desde o último aviso\n"
+                         f"Total: {fmt(total)} {quote} (antes {fmt(ref)})\n"
+                         "Maiores variações em 24h: " +
+                         ", ".join(f"{s.replace(quote, '')} {p:+.1f}%" for s, p in movers))
+            state["carteira_ref"] = total
+
+    resumo_linhas = []
+    for sym in simbolos:
+        for itv in cfg["intervalos"]:
+            try:
+                cs = client.klines(sym, itv, cfg["velas"])
+            except Exception as e:
+                log.warning("%s %s: falha ao buscar velas (%s)", sym, itv, e)
+                continue
+            st = state.setdefault("pares", {}).setdefault(f"{sym}:{itv}", {})
+            resumo, sinais = analyze(cs, precos.get(sym, cs[-1].c), cfg, st)
+            if resumo and itv == cfg["intervalos"][0]:
+                cache.setdefault("resumos", {})[sym] = resumo
+            if resumo:
+                resumo_linhas.append(f"{sym} [{itv}] {resumo['tendencia']}, RSI {resumo['rsi']} | "
+                                     f"S {resumo['suporte']} | R {resumo['resistencia']}")
+            for s in sinais:
+                if notif.pode(f"{sym}:{itv}:{s.chave}"):
+                    notif.enviar(f"🔔 {sym} [{itv}] — {s.titulo}\n" + "\n".join(s.linhas))
+
+    if resumo_linhas:
+        cache["resumo_linhas"], cache["resumo_t"] = resumo_linhas, agora
+    if cfg["resumo_horas"] and agora - state.get("resumo_t", 0) > cfg["resumo_horas"] * 3600 \
+            and resumo_linhas:
+        notif.enviar("📊 Resumo do monitor\n" + "\n".join(resumo_linhas))
+        state["resumo_t"] = agora
+
+# --------------------------------------------------------------------------
+# Ordens e posições abertas
+# --------------------------------------------------------------------------
+def alvo_ordem(o):
+    """Preço que dispara a ordem e se ele é alcançado com o preço caindo ou subindo."""
+    tipo, compra = o["tipo"], o["lado"] == "BUY"
+    if "TRAILING" in tipo:
+        return None, None
+    alvo = o["stop"] if o["stop"] > 0 else o["preco"]
+    if alvo <= 0:
+        return None, None
+    stop = "STOP" in tipo and "TAKE_PROFIT" not in tipo
+    # limite/take-profit de compra e stop de venda: disparam com o preço CAINDO
+    caindo = (compra and not stop) or (not compra and stop)
+    return alvo, caindo
+
+
+class MonitorOrdens:
+    def __init__(self, client, cfg, state, notif, cache):
+        self.c, self.cfg, self.notif, self.cache = client, cfg, notif, cache
+        self.st = state.setdefault("ordens", {})
+        self.st.setdefault("abertas", {})
+        self.st.setdefault("posicoes", {})
+        self.st.setdefault("alcancadas", [])
+        self.st.setdefault("relatorio_t", 0)
+        self.futuros = cfg["monitorar_futuros"]
+
+    @staticmethod
+    def _norm(o, mercado):
+        return {"mercado": mercado, "symbol": o["symbol"], "id": o["orderId"],
+                "lado": o["side"], "tipo": o["type"], "preco": float(o.get("price") or 0),
+                "stop": float(o.get("stopPrice") or 0), "qtd": float(o["origQty"]),
+                "exec": float(o.get("executedQty") or 0)}
+
+    def _ler(self):
+        abertas = {f"spot:{o['symbol']}:{o['orderId']}": self._norm(o, "spot")
+                   for o in self.c.get("/api/v3/openOrders", signed=True)}
+        posicoes = {}
+        if self.futuros:
+            try:
+                for o in self.c.get("/fapi/v1/openOrders", signed=True, base=FAPI_URL):
+                    abertas[f"fut:{o['symbol']}:{o['orderId']}"] = self._norm(o, "fut")
+                for p in self.c.get("/fapi/v2/positionRisk", signed=True, base=FAPI_URL):
+                    amt = float(p["positionAmt"])
+                    if amt:
+                        posicoes[f"{p['symbol']}:{p.get('positionSide', 'BOTH')}"] = {
+                            "symbol": p["symbol"], "qtd": amt,
+                            "entrada": float(p["entryPrice"]), "marca": float(p["markPrice"]),
+                            "pnl": float(p["unRealizedProfit"]),
+                            "liq": float(p.get("liquidationPrice") or 0)}
+            except BinanceErro as e:
+                self.futuros = False
+                log.warning("Futuros desativado: %s", e)
+                self.notif.enviar("ℹ️ Não consegui ler Futuros na Binance "
+                                  f"({e}). Sigo monitorando só ordens do Spot.")
+        return abertas, posicoes
+
+    def _desc(self, o):
+        merc = "Futuros" if o["mercado"] == "fut" else "Spot"
+        lado = "COMPRA" if o["lado"] == "BUY" else "VENDA"
+        alvo, _ = alvo_ordem(o)
+        return f"{o['symbol']} {lado} {o['tipo']} ({merc}) {o['qtd']:g}" + \
+               (f" @ {fmt(alvo)}" if alvo else "")
+
+    def _status_final(self, o):
+        path, base = ("/api/v3/order", BASE_URL) if o["mercado"] == "spot" \
+            else ("/fapi/v1/order", FAPI_URL)
+        d = self.c.get(path, {"symbol": o["symbol"], "orderId": o["id"]}, signed=True, base=base)
+        exe = float(d.get("executedQty") or 0)
+        if float(d.get("avgPrice") or 0) > 0:
+            medio = float(d["avgPrice"])
+        elif exe:
+            medio = float(d.get("cummulativeQuoteQty") or 0) / exe
+        else:
+            medio = 0
+        return d.get("status", "?"), exe, medio
+
+    def verificar(self):
+        abertas, posicoes = self._ler()
+        ant, ant_pos = self.st["abertas"], self.st["posicoes"]
+        precos = self.c.prices() if abertas else {}
+        self.cache["simbolos_ordens"] = {o["symbol"] for o in abertas.values()}
+
+        # ordens que sumiram: executadas, canceladas ou expiradas
+        for k in set(ant) - set(abertas):
+            o = ant[k]
+            try:
+                status, exe, medio = self._status_final(o)
+            except Exception as e:
+                log.warning("Não consegui consultar a ordem %s: %s", k, type(e).__name__)
+                status, exe, medio = "?", 0, 0
+            if status == "FILLED" or exe > 0:
+                self.notif.enviar(f"✅ ORDEM EXECUTADA\n{self._desc(o)}\n"
+                                  f"Executado: {exe:g}" + (f" a {fmt(medio)} (preço médio)" if medio else "") +
+                                  ("" if status == "FILLED" else f" — status {status}"))
+            else:
+                self.notif.enviar(f"❌ Ordem encerrada sem execução ({status})\n{self._desc(o)}")
+
+        for k, o in abertas.items():
+            if k not in ant:
+                self.notif.enviar(f"🆕 Nova ordem aberta\n{self._desc(o)}")
+            elif o["exec"] > ant[k]["exec"] + 1e-12:
+                self.notif.enviar(f"🟡 Execução PARCIAL\n{self._desc(o)}\n"
+                                  f"Executado: {o['exec']:g} de {o['qtd']:g} "
+                                  f"({o['exec'] / o['qtd'] * 100:.0f}%)")
+            alvo, caindo = alvo_ordem(o)
+            preco = precos.get(o["symbol"])
+            if alvo and preco and k not in self.st["alcancadas"] and \
+                    ((caindo and preco <= alvo) or (not caindo and preco >= alvo)):
+                self.st["alcancadas"].append(k)
+                self.notif.enviar(f"🎯 PREÇO DA ORDEM ALCANÇADO\n{self._desc(o)}\n"
+                                  f"Preço atual: {fmt(preco)} — aguardando a execução")
+
+        for k in set(ant_pos) - set(posicoes):
+            p = ant_pos[k]
+            self.notif.enviar(f"🏁 Posição de Futuros encerrada: {p['symbol']} "
+                              f"({'LONG' if p['qtd'] > 0 else 'SHORT'} {abs(p['qtd']):g})")
+        for k in set(posicoes) - set(ant_pos):
+            p = posicoes[k]
+            self.notif.enviar(f"🆕 Posição de Futuros aberta: {p['symbol']} "
+                              f"{'LONG' if p['qtd'] > 0 else 'SHORT'} {abs(p['qtd']):g} "
+                              f"a {fmt(p['entrada'])}")
+
+        self.st["alcancadas"] = [k for k in self.st["alcancadas"] if k in abertas]
+        self.st["abertas"], self.st["posicoes"] = abertas, posicoes
+
+        agora = time.time()
+        if (abertas or posicoes) and \
+                agora - self.st["relatorio_t"] >= self.cfg["relatorio_ordens_min"] * 60:
+            self.st["relatorio_t"] = agora
+            self.notif.enviar(self._relatorio(abertas, posicoes, precos))
+
+    def _relatorio(self, abertas, posicoes, precos):
+        linhas = ["📋 Posições abertas"]
+        for o in sorted(abertas.values(), key=lambda o: o["symbol"]):
+            linha = "• " + self._desc(o)
+            alvo, _ = alvo_ordem(o)
+            preco = precos.get(o["symbol"])
+            if alvo and preco:
+                linha += f"\n  preço {fmt(preco)} — falta {(alvo / preco - 1) * 100:+.2f}% até a ordem"
+            if o["exec"]:
+                linha += f"\n  já executado {o['exec'] / o['qtd'] * 100:.0f}%"
+            r = self.cache.get("resumos", {}).get(o["symbol"])
+            if r:
+                linha += f"\n  [{self.cfg['intervalos'][0]}] {r['tendencia']} | S {r['suporte']} | R {r['resistencia']}"
+            linhas.append(linha)
+        for p in posicoes.values():
+            linha = (f"• {p['symbol']} Futuros {'LONG' if p['qtd'] > 0 else 'SHORT'} {abs(p['qtd']):g}"
+                     f"\n  entrada {fmt(p['entrada'])} | marca {fmt(p['marca'])} | "
+                     f"PnL {p['pnl']:+.2f} USDT")
+            if p["liq"] > 0:
+                linha += f"\n  liquidação {fmt(p['liq'])} ({(p['liq'] / p['marca'] - 1) * 100:+.1f}%)"
+            linhas.append(linha)
+        return "\n".join(linhas)
+
+
+# --------------------------------------------------------------------------
+# Comandos vindos do Telegram (o chatbot grava arquivos *.cmd na pasta)
+# --------------------------------------------------------------------------
+def duracao(txt):
+    """'2h', '30m', '1d', '90' (minutos) -> segundos; vazio -> 0 (sem prazo)."""
+    txt = (txt or "").strip().lower().replace(" ", "")
+    if not txt:
+        return 0
+    mult = {"m": 60, "min": 60, "h": 3600, "d": 86400}
+    for suf in ("min", "m", "h", "d"):
+        if txt.endswith(suf) and txt[:-len(suf)].replace(",", ".").replace(".", "", 1).isdigit():
+            return int(float(txt[:-len(suf)].replace(",", ".")) * mult[suf])
+    return int(float(txt) * 60) if txt.replace(".", "", 1).isdigit() else None
+
+
+def status_txt(client, cfg, notif, cache, ordens):
+    pz = notif.state.get("pausa")
+    if pz:
+        ate = time.strftime("%d/%m %H:%M", time.localtime(pz["ate"])) if pz["ate"] else "sem prazo"
+        cab = f"⏸️ Alertas PAUSADOS ({ate})"
+    else:
+        cab = "▶️ Alertas ativos"
+    linhas = [f"📊 Status do monitor — {cab}"]
+    if cache.get("resumo_linhas"):
+        quando = time.strftime("%H:%M", time.localtime(cache["resumo_t"]))
+        linhas += [f"Análise das {quando}:"] + cache["resumo_linhas"]
+    else:
+        linhas.append("Análise ainda não concluída (aguarde o primeiro ciclo).")
+    if ordens:
+        ab, pos = ordens.st["abertas"], ordens.st["posicoes"]
+        if ab or pos:
+            precos = client.prices() if ab else {}
+            linhas += ["", ordens._relatorio(ab, pos, precos)]
+        else:
+            linhas += ["", "📋 Nenhuma ordem ou posição aberta."]
+    else:
+        linhas += ["", "📋 Monitor de ordens desligado (sem chave ou monitorar_ordens=false)."]
+    return "\n".join(linhas)
+
+
+def processar_comandos(pasta, client, cfg, notif, cache, ordens):
+    textos = notif.buscar_comandos()
+    try:
+        arquivos = sorted(pasta.glob("*.cmd"), key=lambda f: f.stat().st_mtime)
+    except OSError:
+        arquivos = []
+    for f in arquivos:
+        try:
+            textos.append(f.read_text(encoding="utf-8").strip())
+            f.unlink()
+        except OSError as e:
+            log.warning("Não consegui ler o comando %s: %s", f.name, e)
+    for texto in textos:
+        executar_comando(texto, client, cfg, notif, cache, ordens)
+    return bool(textos)
+
+
+def executar_comando(texto, client, cfg, notif, cache, ordens):
+    partes = texto.lstrip("/").split(maxsplit=1)
+    cmd = partes[0].lower().split("@")[0] if partes else ""
+    arg = partes[1] if len(partes) > 1 else ""
+    log.info("Comando recebido: %s %s", cmd, arg)
+    if cmd == "pausar":
+        seg = duracao(arg)
+        if seg is None:
+            notif.enviar("Não entendi a duração. Exemplos: /pausar, /pausar 30m, "
+                         "/pausar 2h, /pausar 1d", forcar=True)
+        else:
+            notif.pausar(seg)
+    elif cmd == "retomar":
+        notif.retomar()
+    elif cmd == "status":
+        try:
+            notif.enviar(status_txt(client, cfg, notif, cache, ordens), forcar=True)
+        except Exception as e:
+            log.exception("Erro no /status")
+            notif.enviar(f"⚠️ Erro ao montar o status: {type(e).__name__}", forcar=True)
+    else:
+        notif.enviar("Comandos do monitor: /status, /pausar [30m|2h|1d], /retomar",
+                     forcar=True)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--config", default=str(APP_DIR / "config.json"))
+    ap.add_argument("--once", action="store_true", help="um ciclo e sai")
+    ap.add_argument("--demo", action="store_true", help="simulação offline")
+    args = ap.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
+                        handlers=[logging.StreamHandler(),
+                                  RotatingFileHandler(APP_DIR / "monitor.log", maxBytes=5_000_000,
+                                                      backupCount=3, encoding="utf-8")])
+    load_env(APP_DIR / ".env")
+    cfg = load_config(Path(args.config))
+
+    if args.demo:
+        return demo(cfg)
+
+    key, secret = os.environ.get("BINANCE_API_KEY"), os.environ.get("BINANCE_API_SECRET")
+    if cfg["usar_carteira"] and not (key and secret):
+        log.warning("Sem BINANCE_API_KEY/SECRET: monitorando só 'simbolos_extras'")
+    client = Binance(key, secret)
+    state_path = APP_DIR / "estado.json"
+    state = load_state(state_path)
+    notif = Notificador(cfg, state)
+    cache = {"validos": client.valid_symbols(cfg["moeda_cotacao"])}
+    log.info("Monitor iniciado (%s)", ", ".join(cfg["intervalos"]))
+
+    ordens = MonitorOrdens(client, cfg, state, notif, cache) \
+        if cfg["monitorar_ordens"] and client.secret else None
+    pasta = Path(cfg["pasta_comandos"] or APP_DIR / "comandos")
+    try:
+        pasta.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        log.warning("Pasta de comandos indisponível (%s): %s", pasta, e)
+    log.info("Lendo comandos em %s%s", pasta,
+             " e no Telegram" if notif.ler_comandos else "")
+    notif.registrar_menu()
+    ultimo_ciclo = ultima_ordem = 0
+    while True:
+        inicio = time.time()
+        rodou = processar_comandos(pasta, client, cfg, notif, cache, ordens)
+        if ordens and inicio - ultima_ordem >= cfg["intervalo_ordens_s"]:
+            ultima_ordem = rodou = inicio
+            try:
+                ordens.verificar()
+            except BinanceErro as e:
+                log.error("Falha ao ler ordens: %s", e)
+            except Exception:
+                log.exception("Erro ao verificar ordens")
+        if inicio - ultimo_ciclo >= cfg["intervalo_verificacao_s"]:
+            ultimo_ciclo = rodou = inicio
+            try:
+                ciclo(client, cfg, state, notif, cache)
+            except Exception:
+                log.exception("Erro no ciclo")
+        if rodou:
+            save_state(state_path, state)
+        if args.once:
+            break
+        time.sleep(max(0.5, 3 - (time.time() - inicio)))   # comandos respondem em ~3 s
+
+
+# --------------------------------------------------------------------------
+# Simulação offline: faixa lateral → pressão → rompimento → reteste
+# --------------------------------------------------------------------------
+def demo(cfg):
+    random.seed(7)
+    cs, p, t = [], 100.0, 0
+    def vela(alvo, ruido, vol):
+        nonlocal p, t
+        o = p
+        c = alvo + random.uniform(-ruido, ruido)
+        h = max(o, c) + random.uniform(0, ruido)
+        l = min(o, c) - random.uniform(0, ruido)
+        cs.append(Candle(t, o, h, l, c, vol * random.uniform(0.8, 1.2), t + 1))
+        p, t = c, t + 2
+    for i in range(160):                           # faixa 100–110
+        vela(105 + 4.5 * math.sin(i / 6), 0.8, 100)
+    for i in range(14):                            # fundos subindo contra 110
+        vela(107.5 + i * 0.18 + 1.2 * math.sin(i), 0.35, 120)
+    vela(112.3, 0.2, 260)                          # rompimento com volume
+    for alvo in (113, 112.4, 111.2, 110.7, 111.4, 112.2):   # reteste e acomodação
+        vela(alvo, 0.3, 110)
+    st, enviados = {}, set()
+    for n in range(100, len(cs) + 1):
+        _, sinais = analyze(cs[:n], cs[n - 1].c, cfg, st)
+        for s in sinais:
+            if s.chave not in enviados:
+                enviados.add(s.chave)
+                print(f"\n[vela {n}] 🔔 {s.titulo}\n  " + "\n  ".join(s.linhas))
+
+
+if __name__ == "__main__":
+    main()

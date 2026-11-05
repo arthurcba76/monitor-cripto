@@ -1,0 +1,25 @@
+[Unit]
+Description=monitor-cripto: carteira Binance, suporte/resistencia e alertas no Telegram
+After=network-online.target time-sync.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Ajuste usuário e caminhos se instalou em outro lugar
+User=cripto
+Group=cripto
+WorkingDirectory=/opt/monitor-cripto/app
+ExecStart=/opt/monitor-cripto/app/.venv/bin/python monitor_cripto.py
+Restart=always
+RestartSec=30
+UMask=0077
+
+# Endurecimento: o programa só escreve na própria pasta
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/monitor-cripto/app
+
+[Install]
+WantedBy=multi-user.target

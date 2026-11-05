@@ -1,0 +1,180 @@
+# monitor-cripto
+
+Monitor de carteira de criptomoedas na **Binance** com alertas no **Telegram**.
+Ele identifica **suporte e resistência**, avisa sobre **pressão em zonas, faixas
+laterais, rompimentos, retestes e falsos rompimentos**, e acompanha as suas
+**ordens e posições abertas**, com aviso imediato quando uma ordem é executada.
+
+Foi feito para rodar 24 horas por dia num servidor pessoal (um PC antigo, um
+notebook, um Raspberry Pi ou uma máquina virtual) como serviço do `systemd`. É um
+único arquivo Python, e a única dependência é `requests`.
+
+> ⚠️ **Não é recomendação de investimento.** O programa não prevê preços e não
+> envia ordens. Ele só reconhece padrões técnicos conhecidos e avisa quando eles
+> aparecem. Padrões técnicos falham com frequência. Use os alertas como motivo
+> para olhar o gráfico, não como ordem de compra ou venda.
+
+---
+
+## Recursos
+
+### Análise de mercado (a cada minuto, só com velas fechadas)
+
+| Alerta | Quando dispara |
+|---|---|
+| 🔔 **Pressão na resistência** | O preço está perto de uma resistência e testou a zona 2 ou mais vezes nas últimas 12 velas. O programa pesa os sinais a favor do rompimento (volatilidade comprimida, fundos ascendentes, volume crescente, tendência de alta) contra os de rejeição (pavios superiores, RSI acima de 70, divergência de RSI) e dá uma leitura: *rompimento iminente*, *risco de rejeição* ou *indefinido*. |
+| 🔔 **Teste de suporte** | A mesma análise no sentido contrário: *perda do suporte iminente*, *suporte segurando* ou *indefinido*. |
+| 🔔 **Faixa lateral** | O preço está oscilando entre um suporte e uma resistência há 20 velas ou mais. Mostra o piso, o teto, o meio e em que ponto da faixa o preço está. |
+| 🔔 **Rompimento** | A primeira vela que fecha além da zona, vindo do outro lado. Diz se o volume confirmou, qual é a zona provável de reteste e qual é o próximo alvo. |
+| 🔔 **Acomodação** | Depois do rompimento, o preço volta à zona e fica do lado novo (a resistência virou suporte, ou o inverso). |
+| 🔔 **Falso rompimento** | O preço fecha de volta do lado antigo da zona. |
+| 💼 **Variação da carteira** | O valor total da carteira mudou X% desde o último aviso. |
+| 📊 **Resumo periódico** | Tendência, RSI, suporte e resistência de cada par, a cada N horas. |
+
+### Ordens e posições (verificadas a cada 15 s)
+
+| Aviso | Quando |
+|---|---|
+| 🆕 Nova ordem ou posição | Foi aberta uma ordem no Spot ou em Futuros, ou uma posição em Futuros. |
+| 🎯 Preço alcançado | O preço chegou ao preço da ordem, mas ela ainda não foi executada. |
+| 🟡 Execução parcial | Parte da ordem foi executada. |
+| ✅ **Ordem executada** | A ordem foi executada, com o preço médio. |
+| ❌ Encerrada | A ordem foi cancelada, expirou ou foi rejeitada. |
+| 🏁 Posição encerrada | Uma posição em Futuros foi fechada. |
+| 📋 Relatório | A cada 5 minutos, **só enquanto houver algo aberto**: distância do preço até cada ordem, suporte e resistência do par e, em Futuros, entrada, PnL e preço de liquidação. |
+
+### Comandos no Telegram
+
+| Comando | O que faz |
+|---|---|
+| `/status` | Mostra na hora a análise atual e as ordens ou posições abertas. |
+| `/pausar` | Pausa os alertas até você mandar `/retomar`. Aceita prazo: `/pausar 30m`, `/pausar 2h`, `/pausar 1d`. |
+| `/retomar` | Volta a enviar os alertas e entrega os avisos de ordens que ficaram guardados durante a pausa. |
+
+O monitor só aceita comandos vindos do `TELEGRAM_CHAT_ID` configurado e ignora
+qualquer outro chat. Durante a pausa ele continua acompanhando tudo: os alertas
+de mercado são descartados (só a contagem aparece ao retomar), e os avisos de
+ordens ficam guardados.
+
+---
+
+## Início rápido
+
+```bash
+git clone https://github.com/SEU-USUARIO/monitor-cripto.git
+cd monitor-cripto
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+
+.venv/bin/python monitor_cripto.py --demo   # simulação offline, não precisa de chaves
+
+cp .env.exemplo .env && chmod 600 .env      # preencha as chaves (veja abaixo)
+cp config.exemplo.json config.json          # opcional: ajuste os parâmetros
+.venv/bin/python monitor_cripto.py --once   # um ciclo real e sai
+.venv/bin/python monitor_cripto.py          # roda continuamente
+```
+
+Para deixar rodando 24 horas por dia, veja **[docs/servidor-pessoal.md](docs/servidor-pessoal.md)**.
+Lá estão a preparação do servidor (em máquina própria ou virtual) e a
+instalação como serviço.
+
+### 1. Chave da Binance (somente leitura)
+
+1. Na Binance, abra **Perfil → Gerenciamento de API → Criar API** (tipo *gerada pelo sistema*).
+2. Marque **apenas "Enable Reading"**. **Nunca** habilite trade nem saque: o programa não precisa disso.
+3. Em **restrição de acesso por IP**, informe o IP público do servidor (descubra com `curl -4 ifconfig.me`).
+4. Coloque a chave e o segredo em `BINANCE_API_KEY` e `BINANCE_API_SECRET` no `.env`.
+
+Sem chave, o programa ainda funciona, só com os pares de `simbolos_extras`,
+porque os preços são públicos.
+
+### 2. Bot do Telegram
+
+1. No Telegram, fale com o **@BotFather**, mande `/newbot` e copie o token para `TELEGRAM_TOKEN`.
+2. Abra uma conversa com o seu bot novo e mande `/start`. Sem isso, o bot não consegue te enviar mensagens.
+3. Descubra o seu ID com o **@userinfobot** e coloque em `TELEGRAM_CHAT_ID`.
+
+> Use um bot **só para o monitor**. Se o mesmo token já for lido por outro
+> programa, como um chatbot, os dois entram em conflito. Nesse caso, veja
+> [docs/comandos-externos.md](docs/comandos-externos.md).
+
+**Dica de colagem:** ao colar chaves pelo celular ou por SSH, confira se não
+entraram espaços, TABs, quebras de linha ou texto extra. Confira assim, sem
+mostrar os valores:
+
+```bash
+awk -F= '!/^#/ && NF>1 {print $1, length($2)}' .env   # chaves Binance: 64 caracteres cada
+```
+
+---
+
+## Configuração (`config.json`)
+
+Todos os parâmetros têm valor padrão. No `config.json`, coloque só o que quiser
+mudar.
+
+| Parâmetro | Padrão | Descrição |
+|---|---|---|
+| `moeda_cotacao` | `USDT` | Moeda em que os pares são cotados. |
+| `usar_carteira` | `true` | Lê os saldos da conta e monitora as moedas que você tem. |
+| `simbolos_extras` | `["BTCUSDT"]` | Pares monitorados mesmo sem saldo. |
+| `valor_minimo_cotacao` | `10` | Ignora saldos menores que esse valor ("poeira"). |
+| `intervalos` | `["1h","4h"]` | Tempos gráficos analisados (`15m`, `1h`, `4h`, `1d`…). |
+| `pivo_janela` | `5` | Velas de cada lado para que um topo ou fundo conte como pivô. |
+| `min_toques` | `2` | Toques mínimos para que uma zona valha. Use 3 para ver só as zonas mais fortes. |
+| `tolerancia_zona_atr` | `0.6` | Pivôs a menos de X ATR uns dos outros viram a mesma zona. |
+| `proximidade_atr` | `0.5` | Distância, em ATR, para considerar que o preço está perto da zona. |
+| `rompimento_atr` | `0.25` | O fechamento precisa passar X ATR além da zona para contar como rompimento. |
+| `volume_rompimento` | `1.3` | O rompimento é confirmado se o volume da vela for pelo menos X vezes a média. |
+| `cooldown_min` | `240` | Tempo mínimo antes de repetir o mesmo alerta. |
+| `variacao_carteira_pct` | `3.0` | Variação da carteira que dispara o aviso 💼. |
+| `resumo_horas` | `12` | Intervalo do resumo 📊 (0 desliga). |
+| `monitorar_ordens` | `true` | Acompanha as ordens abertas. |
+| `monitorar_futuros` | `true` | Inclui Futuros USDⓈ-M. Desliga sozinho se a chave não tiver acesso. |
+| `intervalo_ordens_s` | `15` | Frequência da verificação das ordens. |
+| `relatorio_ordens_min` | `5` | Intervalo do relatório 📋 enquanto houver algo aberto. |
+| `comandos_telegram` | `true` | O próprio monitor lê os comandos enviados ao bot. |
+| `pasta_comandos` | `""` | Pasta onde outro programa pode gravar comandos (`*.cmd`). |
+
+### Como as zonas são encontradas
+
+1. O programa marca **pivôs**: topos e fundos locais, com 5 velas de cada lado.
+2. Pivôs a menos de 0,6 ATR uns dos outros formam uma **zona**, que precisa de 2 toques ou mais.
+3. A zona mais próxima acima do preço é a **resistência**, e a mais próxima abaixo é o **suporte**.
+4. Só **velas fechadas** entram na análise. O preço ao vivo serve só para medir a proximidade.
+
+O ATR (média do range verdadeiro) faz todas as distâncias se adaptarem à
+volatilidade de cada moeda e de cada tempo gráfico.
+
+---
+
+## Arquivos
+
+```
+monitor_cripto.py           programa
+config.exemplo.json         todos os parâmetros com valores padrão
+.env.exemplo                modelo das credenciais
+systemd/monitor-cripto.service
+docs/servidor-pessoal.md    como montar o servidor e instalar como serviço
+docs/comandos-externos.md   comandos quando o bot é compartilhado com outro programa
+```
+
+Gerados durante a execução (ficam fora do git): `.env`, `config.json`,
+`estado.json` (o que já foi avisado, a pausa e as ordens em acompanhamento) e
+`monitor.log` (rotativo, até 4 × 5 MB).
+
+## Segurança
+
+- Use chave **somente leitura** e restrita por IP. Se a chave vazar, ninguém consegue operar nem sacar com ela.
+- `chmod 600 .env`. Nunca faça commit do `.env`: ele já está no `.gitignore`.
+- Não mande prints do `.env` nem do terminal com as chaves visíveis.
+- Rode com um usuário próprio, sem sudo (veja o guia do servidor).
+
+## Contribuindo
+
+Issues e pull requests são bem-vindos. Antes de enviar, rode a simulação
+offline com `python3 monitor_cripto.py --demo`. Ela deve terminar com
+"Acomodação após rompimento de alta".
+
+## Licença
+
+[MIT](LICENSE)
