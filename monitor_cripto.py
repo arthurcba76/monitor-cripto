@@ -25,6 +25,7 @@ import os
 import random
 import re
 import sys
+import queue
 import threading
 import time
 from logging.handlers import RotatingFileHandler
@@ -1046,12 +1047,25 @@ class Configurador:
         return f"✅ {ITENS[item][0]} salvo"
 
     # ---- clique em botão ------------------------------------------------------
-    def on_callback(self, cb_id, msg_id, dado):
+    def on_callback(self, cb_id, msg_id, dado, respondido=False):
         w = self.wz
+        self._aviso = ""
+
+        def avisar(txt):
+            # o botão já foi confirmado: o aviso aparece no topo do menu
+            if respondido:
+                self._aviso = txt
+            else:
+                self.notif.responder_cb(cb_id, txt)
+
         if not w or w.get("msg") != msg_id:
-            self.notif.responder_cb(cb_id, "Este menu expirou. Mande /config de novo.")
+            if respondido:
+                self.notif.enviar("⌛ Este menu expirou. Mande /config de novo.", forcar=True)
+            else:
+                self.notif.responder_cb(cb_id, "Este menu expirou. Mande /config de novo.")
             return
-        self.notif.responder_cb(cb_id)
+        if not respondido:
+            self.notif.responder_cb(cb_id)
         acao, _, val = dado.partition(":")
         d = w["dados"]
         if acao == "fim":
@@ -1090,10 +1104,12 @@ class Configurador:
             self._avancar()
         elif acao == "prox":
             if w["passo"] == "dias" and not d.get("dias"):
-                self.notif.responder_cb(cb_id, "Marque pelo menos um dia.")
+                avisar("Marque pelo menos um dia.")
+                self.notif.editar(msg_id, *self._tela_aviso())
                 return
             if w["passo"] == "moedas" and not d.get("moedas"):
-                self.notif.responder_cb(cb_id, "Marque pelo menos uma moeda.")
+                avisar("Marque pelo menos uma moeda.")
+                self.notif.editar(msg_id, *self._tela_aviso())
                 return
             if w["passo"] == "dias":
                 d["modo"] = "custom"
@@ -1108,7 +1124,7 @@ class Configurador:
             chave = "inicio" if w["passo"] == "ini_m" else "fim"
             d[chave] = d[chave] // 60 * 60 + int(val)
             if chave == "fim" and d["fim"] == d["inicio"]:
-                self.notif.responder_cb(cb_id, "O fim não pode ser igual ao início.")
+                avisar("O fim não pode ser igual ao início.")
                 w["passo"] = "fim_h"
             else:
                 self._avancar()
@@ -1132,7 +1148,13 @@ class Configurador:
             w.update({"item": None, "passo": None, "dados": {}})
             self.notif.editar(msg_id, *self.tela_menu(aviso))
             return
-        self.notif.editar(msg_id, *self.tela())
+        self.notif.editar(msg_id, *self._tela_aviso())
+
+    def _tela_aviso(self):
+        texto, teclado = self.tela()
+        if getattr(self, "_aviso", ""):
+            texto = f"⚠️ {self._aviso}\n\n{texto}"
+        return texto, teclado
 
 
 class Notificador:
@@ -1144,6 +1166,7 @@ class Notificador:
         self.state = state
         self.agenda = None
         self.config = None
+        self.tg_offset = state.get("tg_offset", 0)
         self.ler_comandos = cfg["comandos_telegram"] and bool(self.token and self.chat)
 
     # ---- comandos recebidos pelo próprio bot ------------------------------
@@ -1179,9 +1202,11 @@ class Notificador:
         if not (self.token and cb_id):
             return
         try:
-            self._api("answerCallbackQuery", callback_query_id=cb_id, text=texto)
-        except (requests.RequestException, ValueError):
-            pass
+            d = self._api("answerCallbackQuery", callback_query_id=cb_id, text=texto)
+            if not d.get("ok"):
+                log.warning("Telegram recusou a resposta ao botão: %s", d.get("description"))
+        except (requests.RequestException, ValueError) as e:
+            log.warning("Falha ao responder botão: %s", type(e).__name__)
 
     def registrar_menu(self):
         if not self.ler_comandos:
@@ -1200,7 +1225,7 @@ class Notificador:
         if not self.ler_comandos:
             return []
         try:
-            d = self._api("getUpdates", offset=self.state.get("tg_offset", 0),
+            d = self._api("getUpdates", offset=self.tg_offset,
                           timeout=0, allowed_updates=["message", "callback_query"])
         except (requests.RequestException, ValueError) as e:
             log.warning("Falha ao ler comandos do Telegram: %s", type(e).__name__)
@@ -1213,7 +1238,7 @@ class Notificador:
             return []
         textos = []
         for u in d.get("result", []):
-            self.state["tg_offset"] = u["update_id"] + 1
+            self.tg_offset = u["update_id"] + 1
             cq = u.get("callback_query")
             if cq:
                 msg = cq.get("message") or {}
@@ -1382,6 +1407,8 @@ def ciclo(client, cfg, state, notif, cache):
             except Exception as e:
                 log.warning("%s %s: falha ao buscar velas (%s)", sym, itv, e)
                 continue
+            if cache.get("drenar"):
+                cache["drenar"]()                 # responde comandos sem esperar o ciclo
             st = state.setdefault("pares", {}).setdefault(f"{sym}:{itv}", {})
             resumo, sinais = analyze(cs, precos.get(sym, cs[-1].c), cfg, st)
             if resumo and itv == cfg["intervalos"][0]:
@@ -1594,7 +1621,8 @@ def status_txt(client, cfg, notif, cache, ordens):
     return "\n".join(linhas)
 
 
-def processar_comandos(pasta, client, cfg, notif, cache, ordens):
+def coletar_comandos(pasta, notif):
+    """Lê comandos do Telegram e da pasta. Não executa nada (pode rodar em thread)."""
     textos = notif.buscar_comandos()
     try:
         arquivos = sorted(pasta.glob("*.cmd"), key=lambda f: f.stat().st_mtime)
@@ -1613,9 +1641,48 @@ def processar_comandos(pasta, client, cfg, notif, cache, ordens):
             f.unlink()
         except OSError as e:
             log.warning("Não consegui ler o comando %s: %s", f.name, e)
+    return textos
+
+
+def processar_comandos(pasta, client, cfg, notif, cache, ordens):
+    textos = coletar_comandos(pasta, notif)
     for texto in textos:
         executar_comando(texto, client, cfg, notif, cache, ordens)
     return bool(textos)
+
+
+class Receptor:
+    """Recebe comandos e cliques a cada 0,5 s numa thread própria.
+
+    Cliques em botões são confirmados ao Telegram NA HORA (senão o botão fica
+    "carregando" e expira); a execução vai para uma fila que o laço principal
+    esvazia com frequência, inclusive no meio da análise.
+    """
+
+    def __init__(self, pasta, notif):
+        self.pasta, self.notif, self.fila = pasta, notif, queue.Queue()
+
+    def rodar(self):
+        while True:
+            try:
+                for item in coletar_comandos(self.pasta, self.notif):
+                    if isinstance(item, dict) and item.get("callback"):
+                        self.notif.responder_cb(item["callback"].get("id"))
+                        item["callback"]["respondido"] = True
+                    self.fila.put(item)
+            except Exception:
+                log.exception("Erro ao receber comandos")
+            time.sleep(0.5)
+
+    def drenar(self, client, cfg, cache, ordens):
+        n = 0
+        while True:
+            try:
+                item = self.fila.get_nowait()
+            except queue.Empty:
+                return n
+            executar_comando(item, client, cfg, self.notif, cache, ordens)
+            n += 1
 
 
 AJUDA = {
@@ -2334,7 +2401,8 @@ def executar_comando(texto, client, cfg, notif, cache, ordens):
         if notif.config and str(cb.get("data", "")).startswith("cfg|"):
             log.info("Botão: %s", cb["data"])
             try:
-                notif.config.on_callback(cb.get("id"), cb.get("message_id"), cb["data"][4:])
+                notif.config.on_callback(cb.get("id"), cb.get("message_id"), cb["data"][4:],
+                                         bool(cb.get("respondido")))
             except Exception:
                 log.exception("Erro no assistente /config")
                 notif.responder_cb(cb.get("id"), "Erro no menu. Mande /config de novo.")
@@ -2431,11 +2499,19 @@ def main():
         threading.Thread(target=reg.rodar, name="regime", daemon=True).start()
         log.info("Camada de regime ativa (notícias a cada %s min, regime a cada %s h)",
                  cfg["noticias_min"], cfg["regime_horas"])
+    receptor = None
+    if not args.once:
+        receptor = Receptor(pasta, notif)
+        threading.Thread(target=receptor.rodar, name="comandos", daemon=True).start()
+        cache["drenar"] = lambda: receptor.drenar(client, cfg, cache, ordens)
     ultimo_ciclo = ultima_ordem = 0
     estava_dentro = agenda.dentro()
     while True:
         inicio = time.time()
-        rodou = processar_comandos(pasta, client, cfg, notif, cache, ordens)
+        if receptor:
+            rodou = receptor.drenar(client, cfg, cache, ordens) > 0
+        else:
+            rodou = processar_comandos(pasta, client, cfg, notif, cache, ordens)
         mudou = cache.pop("regime_mudou", None)
         if mudou:
             notif.enviar(f"🌡️ Mudança de regime: {mudou[0]} → {mudou[1]}\n\n" +
@@ -2491,10 +2567,11 @@ def main():
         if cache.pop("regime_pronto", False):
             notif.enviar(regime_txt(cache.get("regime")))
         if rodou:
+            state["tg_offset"] = notif.tg_offset
             save_state(state_path, state)
         if args.once:
             break
-        time.sleep(max(0.5, 3 - (time.time() - inicio)))   # comandos respondem em ~3 s
+        time.sleep(0.5)                     # comandos e cliques executam em até ~0,5 s
 
 
 # --------------------------------------------------------------------------
