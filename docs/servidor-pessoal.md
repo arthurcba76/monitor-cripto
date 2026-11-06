@@ -176,5 +176,5 @@ do git.
 | `Telegram recusou a mensagem: 404` | Token inválido ou incompleto. |
 | `Telegram recusou a mensagem: 400 chat not found` | Chat ID errado, ou você não mandou `/start` para o bot. |
 | `Outro programa já lê este bot (409)` | O mesmo token está em uso por outro programa. Crie um bot só para o monitor ou veja [comandos-externos.md](comandos-externos.md). |
-| Funciona com `--once`, mas não envia nada com o tempo | O serviço não está rodando: confira com `systemctl status monitor-cripto`. Lembre também que o resumo sai só a cada `resumo_horas` e que os alertas só aparecem quando há um padrão. Use `/status` para receber o estado na hora. |
+| Funciona com `--once`, mas não envia nada com o tempo | O serviço não está rodando: confira com `systemctl status monitor-cripto`. Lembre também que os relatórios seguem o `/frequencia` e o horário do `/agenda` e que os alertas só aparecem quando há um padrão. Use `/status` para receber o estado na hora. |
 | Nenhum aviso de ordens | `Futuros desativado` no log quer dizer que a chave não lê Futuros, e o Spot continua normal. Se não houver nenhuma ordem aberta, também não há relatório. |

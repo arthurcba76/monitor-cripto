@@ -23,7 +23,7 @@ repassá-los ao monitor por uma pasta:
    ```
    Se os serviços usam `ProtectSystem=strict`, acrescente a pasta ao
    `ReadWritePaths=` e coloque `SupplementaryGroups=monitorcmd` nos dois.
-3. No outro programa, ao receber `/status`, `/pausar [prazo]`, `/retomar`, `/tendencia [moeda]` ou `/ajuda [tema]`
+3. No outro programa, ao receber `/status`, `/pausar [prazo]`, `/retomar`, `/tendencia [moeda]`, `/regime`, `/agenda [...]`, `/frequencia [...]` ou `/ajuda [tema]`
    **do seu chat**, grave o texto exato do comando num arquivo novo, de forma
    atômica:
 

@@ -29,7 +29,7 @@ notebook, um Raspberry Pi ou uma máquina virtual) como serviço do `systemd`. �
 | 🔔 **Acomodação** | Depois do rompimento, o preço volta à zona e fica do lado novo (a resistência virou suporte, ou o inverso). |
 | 🔔 **Falso rompimento** | O preço fecha de volta do lado antigo da zona. |
 | 💼 **Variação da carteira** | O valor total da carteira mudou X% desde o último aviso. |
-| 📊 **Resumo periódico** | Tendência, RSI, suporte e resistência de cada par, a cada N horas. |
+| 📊 **Análise periódica** | Tendência, RSI, suporte e resistência de cada par, na frequência escolhida em `/frequencia`. |
 
 ### Ordens e posições (verificadas a cada 15 s)
 
@@ -52,7 +52,9 @@ notebook, um Raspberry Pi ou uma máquina virtual) como serviço do `systemd`. �
 | `/retomar` | Volta a enviar os alertas e entrega os avisos de ordens que ficaram guardados durante a pausa. |
 | `/tendencia` | Sugestão estatística de **alta, baixa ou lateral**, com o teto e o piso que o preço tende a alcançar antes de romper, a chance estimada de tocar cada lado primeiro, o tempo típico, a faixa provável em 24h e os fatores usados. Outra moeda: `/tendencia ETH`. |
 | `/regime` | Termômetro diário do mercado: **EUFORIA, OTIMISMO, NEUTRO, MEDO ou CAPITULAÇÃO**, com MVRV Z-Score, fluxo e saldo de BTC nas corretoras, endereços ativos, Fear & Greed, juros do Fed, dólar e sentimento das notícias. Você também recebe um aviso quando o regime muda. |
-| `/ajuda` | Explica em linguagem simples cada alerta, cada termo dos relatórios (suporte, RSI, ATR, pavio…), os avisos de ordens e os comandos. Para ver só uma parte: `/ajuda alertas`, `/ajuda termos`, `/ajuda ordens`, `/ajuda tendencia`, `/ajuda regime` ou `/ajuda comandos`. |
+| `/agenda` | Horário de atividade: `/agenda 24/7`, `/agenda uteis 08:00-18:00`, `/agenda seg,qua,sex 09:00-17:00`, `/agenda 22:00-06:00`. Fora do horário nada é enviado, e os avisos ficam guardados até o horário abrir. `/agenda ordens sempre` (padrão) faz as execuções de ordens chegarem na hora, mesmo fora do horário. |
+| `/frequencia` | Frequência de cada relatório: `/frequencia analise 30m`, `/frequencia sugestao 1h BTC ETH`, `/frequencia regime 2h`, `/frequencia ordens 5m`, ou `off` para desligar. |
+| `/ajuda` | Explica em linguagem simples cada alerta, cada termo dos relatórios (suporte, RSI, ATR, pavio…), os avisos de ordens e os comandos. Para ver só uma parte: `/ajuda alertas`, `/ajuda termos`, `/ajuda ordens`, `/ajuda tendencia`, `/ajuda regime`, `/ajuda agenda` ou `/ajuda comandos`. |
 
 O monitor só aceita comandos vindos do `TELEGRAM_CHAT_ID` configurado e ignora
 qualquer outro chat. Durante a pausa ele continua acompanhando tudo: os alertas
@@ -130,11 +132,16 @@ mudar.
 | `volume_rompimento` | `1.3` | O rompimento é confirmado se o volume da vela for pelo menos X vezes a média. |
 | `cooldown_min` | `240` | Tempo mínimo antes de repetir o mesmo alerta. |
 | `variacao_carteira_pct` | `3.0` | Variação da carteira que dispara o aviso 💼. |
-| `resumo_horas` | `12` | Intervalo do resumo 📊 (0 desliga). |
+| `agenda_padrao` | `"24/7"` | Horário inicial (depois é ajustado por `/agenda`). |
+| `ordens_fora_do_horario` | `true` | As execuções de ordens chegam mesmo fora do horário. |
+| `freq_analise_min` | `720` | 📊 Análise periódica, em minutos (0 desliga). |
+| `freq_sugestao_min` | `0` | 📈 `/tendencia` automático (0 desliga). |
+| `freq_regime_min` | `0` | 🌡️ `/regime` automático (0 = só quando o regime muda). |
+| `sugestao_simbolos` | `[]` | Pares da sugestão automática (vazio = `simbolos_extras`). |
 | `monitorar_ordens` | `true` | Acompanha as ordens abertas. |
 | `monitorar_futuros` | `true` | Inclui Futuros USDⓈ-M. Desliga sozinho se a chave não tiver acesso. |
 | `intervalo_ordens_s` | `15` | Frequência da verificação das ordens. |
-| `relatorio_ordens_min` | `5` | Intervalo do relatório 📋 enquanto houver algo aberto. |
+| `relatorio_ordens_min` | `5` | Intervalo inicial do relatório 📋 enquanto houver algo aberto. |
 | `comandos_telegram` | `true` | O próprio monitor lê os comandos enviados ao bot. |
 | `pasta_comandos` | `""` | Pasta onde outro programa pode gravar comandos (`*.cmd`). |
 | `regime` | `true` | Liga a camada diária (on-chain, sentimento, notícias, macro). |

@@ -63,11 +63,17 @@ DEFAULT_CONFIG = {
     "validade_rompimento_velas": 30,  # por quantas velas acompanhar o reteste
     "variacao_carteira_pct": 3.0,     # alerta se o total da carteira mudar X%
     "cooldown_min": 240,              # não repete o mesmo alerta antes disso
-    "resumo_horas": 12,               # resumo periódico no Telegram (0 desliga)
     "monitorar_ordens": True,         # ordens abertas no Spot (e Futuros, se houver)
     "monitorar_futuros": True,        # desliga sozinho se a chave não tiver acesso
     "intervalo_ordens_s": 15,         # checagem de execução de ordens
     "relatorio_ordens_min": 5,        # relatório enquanto houver ordem/posição aberta
+    # Agenda (valores iniciais; depois ajuste pelo Telegram com /agenda e /frequencia)
+    "agenda_padrao": "24/7",          # ou "uteis 08:00-18:00", "seg,qua,sex 09:00-17:00"
+    "ordens_fora_do_horario": True,   # avisos de execução chegam mesmo fora do horário
+    "freq_analise_min": 720,          # 📊 análise periódica (0 desliga)
+    "freq_sugestao_min": 0,           # 📈 /tendencia automático (0 desliga)
+    "freq_regime_min": 0,             # 🌡️ /regime automático (0 = só na mudança)
+    "sugestao_simbolos": [],          # pares da sugestão automática (vazio = simbolos_extras)
     "comandos_telegram": True,        # o próprio monitor lê /status, /pausar, /retomar
                                       # (use false se o bot já é lido por outro programa)
     "pasta_comandos": "",             # alternativa: outro programa grava *.cmd aqui;
@@ -93,11 +99,14 @@ COMANDOS_MENU = [
     {"command": "retomar", "description": "Retoma os alertas"},
     {"command": "tendencia", "description": "Sugestão de direção e alvos (ex.: /tendencia ETH)"},
     {"command": "regime", "description": "Termômetro diário: on-chain, sentimento, macro"},
+    {"command": "agenda", "description": "Horário de atividade (ex.: /agenda uteis 08:00-18:00)"},
+    {"command": "frequencia", "description": "Frequência dos relatórios (ex.: /frequencia regime 2h)"},
     {"command": "ajuda", "description": "O que significa cada informação"},
 ]
 
 # Avisos de ordens guardados durante a pausa e entregues ao retomar
 CRITICOS = ("✅", "❌", "🟡", "🎯", "🏁", "🆕", "⚠️")
+ORDENS_URGENTES = ("✅", "❌", "🟡", "🎯", "🏁", "🆕")
 
 
 # --------------------------------------------------------------------------
@@ -571,6 +580,201 @@ def analyze(cs, price, cfg, st):
 # --------------------------------------------------------------------------
 # Alertas
 # --------------------------------------------------------------------------
+
+# --------------------------------------------------------------------------
+# Agenda: horário de atividade e frequência de cada relatório (ajustável
+# pelo Telegram com /agenda e /frequencia; fica salvo no estado)
+# --------------------------------------------------------------------------
+DIAS = ["seg", "ter", "qua", "qui", "sex", "sab", "dom"]
+TIPOS_FREQ = {
+    "analise": "📊 Análise (tendência, RSI, suporte e resistência de cada par)",
+    "sugestao": "📈 Sugestão de tendência (/tendencia automático)",
+    "regime": "🌡️ Regime de mercado (/regime automático)",
+    "ordens": "📋 Relatório de ordens/posições abertas",
+}
+SINONIMOS_FREQ = {"análise": "analise", "resumo": "analise", "sugestão": "sugestao",
+                  "tendencia": "sugestao", "tendência": "sugestao", "ordem": "ordens",
+                  "posicoes": "ordens", "posições": "ordens"}
+
+
+def _hm(txt):
+    h, _, m = txt.strip().partition(":")
+    h, m = int(h), int(m or 0)
+    if not (0 <= h <= 24 and 0 <= m < 60):
+        raise ValueError
+    return h * 60 + m
+
+
+def _dur_txt(minutos):
+    if not minutos:
+        return "desligado"
+    if minutos % 1440 == 0:
+        return f"a cada {minutos // 1440} dia(s)"
+    if minutos % 60 == 0:
+        return f"a cada {minutos // 60}h"
+    return f"a cada {minutos} min"
+
+
+class Agenda:
+    def __init__(self, cfg, state):
+        self.cfg = cfg
+        self.st = state.setdefault("agenda", {})
+        if "janela" not in self.st:
+            self.st["janela"] = self._parse_janela(cfg["agenda_padrao"])
+        self.st.setdefault("ordens_sempre", cfg["ordens_fora_do_horario"])
+        f = self.st.setdefault("freq", {})
+        padrao = {"analise": cfg["freq_analise_min"], "sugestao": cfg["freq_sugestao_min"],
+                  "regime": cfg["freq_regime_min"], "ordens": cfg["relatorio_ordens_min"]}
+        for k, v in padrao.items():
+            f.setdefault(k, v)
+        self.st.setdefault("ultimo", {})
+        self.st.setdefault("simbolos_sugestao", list(cfg["sugestao_simbolos"]))
+
+    # ---- janela de atividade --------------------------------------------
+    @staticmethod
+    def _parse_janela(txt):
+        t = txt.strip().lower()
+        if t in ("24/7", "24x7", "sempre", "continuo", "contínuo", "integral"):
+            return None
+        partes = t.split()
+        if len(partes) == 1 and "-" in partes[0] and ":" in partes[0]:
+            partes = ["todos"] + partes
+        if len(partes) != 2:
+            raise ValueError
+        dias_txt, horas = partes
+        if dias_txt in ("uteis", "úteis", "util", "útil"):
+            dias = [0, 1, 2, 3, 4]
+        elif dias_txt in ("todos", "diario", "diário", "todo"):
+            dias = list(range(7))
+        elif dias_txt in ("fds", "fimdesemana"):
+            dias = [5, 6]
+        else:
+            dias = set()
+            for pedaco in dias_txt.replace("á", "a").split(","):
+                if "-" in pedaco:
+                    a, b = (DIAS.index(x[:3]) for x in pedaco.split("-"))
+                    dias |= set(range(a, b + 1)) if a <= b else set(range(a, 7)) | set(range(0, b + 1))
+                else:
+                    dias.add(DIAS.index(pedaco[:3]))
+            dias = sorted(dias)
+        ini, _, fim = horas.partition("-")
+        return {"dias": dias, "inicio": _hm(ini), "fim": _hm(fim)}
+
+    def dentro(self, t=None):
+        j = self.st["janela"]
+        if not j:
+            return True
+        lt = time.localtime(t or time.time())
+        minuto, dia = lt.tm_hour * 60 + lt.tm_min, lt.tm_wday
+        if j["inicio"] <= j["fim"]:
+            return dia in j["dias"] and j["inicio"] <= minuto < j["fim"]
+        # janela que atravessa a meia-noite (ex.: 22:00-06:00)
+        if minuto >= j["inicio"]:
+            return dia in j["dias"]
+        return minuto < j["fim"] and (dia - 1) % 7 in j["dias"]
+
+    def janela_txt(self):
+        j = self.st["janela"]
+        if not j:
+            return "24/7 (sempre ativo)"
+        if j["dias"] == [0, 1, 2, 3, 4]:
+            d = "dias úteis"
+        elif j["dias"] == list(range(7)):
+            d = "todos os dias"
+        else:
+            d = ", ".join(DIAS[x] for x in j["dias"])
+        hm = lambda m: f"{m // 60:02d}:{m % 60:02d}"
+        return f"{d}, {hm(j['inicio'])}–{hm(j['fim'])}"
+
+    # ---- frequências ------------------------------------------------------
+    def freq(self, tipo):
+        return self.st["freq"].get(tipo, 0)
+
+    def vencido(self, tipo, agora=None):
+        """True se o relatório está na hora (e marca como enviado)."""
+        agora = agora or time.time()
+        f = self.freq(tipo)
+        if not f or not self.dentro(agora):
+            return False
+        if agora - self.st["ultimo"].get(tipo, 0) < f * 60:
+            return False
+        self.st["ultimo"][tipo] = agora
+        return True
+
+    def texto(self):
+        linhas = ["🗓️ Agenda do monitor",
+                  f"Horário de atividade: {self.janela_txt()}" +
+                  ("" if self.dentro() else "  (agora: FORA do horário)"),
+                  "Avisos de execução de ordens fora do horário: " +
+                  ("enviados na hora" if self.st["ordens_sempre"] else "guardados até o horário abrir"),
+                  "", "Frequência dos relatórios:"]
+        for k, desc in TIPOS_FREQ.items():
+            extra = ""
+            if k == "sugestao" and self.freq(k):
+                extra = " — " + ", ".join(self.simbolos_sugestao())
+            if k == "ordens":
+                extra = " (só enquanto houver algo aberto)"
+            linhas.append(f"• {desc}: {_dur_txt(self.freq(k))}{extra}")
+        linhas += ["",
+                   "Alertas de padrão (🔔), mudança de regime e avisos de ordens chegam quando "
+                   "acontecem, dentro do horário.",
+                   "",
+                   "Ajustar: /agenda 24/7 | /agenda uteis 08:00-18:00 | "
+                   "/agenda seg,qua,sex 09:00-17:00 | /agenda ordens sempre|guardar",
+                   "/frequencia regime 2h | /frequencia analise 30m | "
+                   "/frequencia sugestao 1h BTC ETH | /frequencia ordens 5m | "
+                   "/frequencia sugestao off"]
+        return "\n".join(linhas)
+
+    def simbolos_sugestao(self):
+        return self.st["simbolos_sugestao"] or list(self.cfg["simbolos_extras"]) or ["BTC"]
+
+    # ---- comandos ---------------------------------------------------------
+    def cmd_agenda(self, arg):
+        a = arg.strip().lower()
+        if not a:
+            return self.texto()
+        if a.startswith("ordens"):
+            op = a.split()[-1]
+            if op not in ("sempre", "guardar"):
+                return "Use /agenda ordens sempre  ou  /agenda ordens guardar"
+            self.st["ordens_sempre"] = op == "sempre"
+            return "✅ Avisos de execução fora do horário: " + \
+                ("enviados na hora." if op == "sempre" else "guardados até o horário abrir.")
+        try:
+            self.st["janela"] = self._parse_janela(a)
+        except (ValueError, IndexError):
+            return ("Não entendi. Exemplos:\n/agenda 24/7\n/agenda uteis 08:00-18:00\n"
+                    "/agenda todos 07:00-23:00\n/agenda seg-sex 09:00-17:30\n"
+                    "/agenda seg,qua,sex 09:00-17:00\n/agenda 22:00-06:00")
+        return "✅ Horário de atividade: " + self.janela_txt() + \
+            ("" if self.dentro() else "\n(agora está fora do horário; alertas ficam guardados)")
+
+    def cmd_freq(self, arg):
+        partes = arg.strip().lower().split()
+        if not partes:
+            return self.texto()
+        tipo = SINONIMOS_FREQ.get(partes[0], partes[0])
+        if tipo not in TIPOS_FREQ or len(partes) < 2:
+            return ("Use /frequencia <tipo> <tempo>. Tipos: analise, sugestao, regime, ordens.\n"
+                    "Tempo: 15m, 30m, 1h, 2h, 1d ou off. Ex.: /frequencia regime 2h")
+        val = partes[1]
+        if val in ("off", "0", "desligar", "nao", "não"):
+            minutos = 0
+        else:
+            seg = duracao(val)
+            if not seg or seg < 60:
+                return "Tempo inválido. Use, por exemplo, 5m, 30m, 1h, 2h ou 1d (mínimo 1 min)."
+            minutos = seg // 60
+        self.st["freq"][tipo] = minutos
+        self.st["ultimo"][tipo] = 0                 # envia já no próximo ciclo
+        extra = ""
+        if tipo == "sugestao" and len(partes) > 2:
+            self.st["simbolos_sugestao"] = [p.upper() for p in partes[2:]]
+            extra = " — " + ", ".join(self.st["simbolos_sugestao"])
+        return f"✅ {TIPOS_FREQ[tipo]}: {_dur_txt(minutos)}{extra}"
+
+
 class Notificador:
     def __init__(self, cfg, state):
         self.token = os.environ.get("TELEGRAM_TOKEN")
@@ -578,6 +782,7 @@ class Notificador:
         self.cooldown = cfg["cooldown_min"] * 60
         self.enviados = state.setdefault("enviados", {})
         self.state = state
+        self.agenda = None
         self.ler_comandos = cfg["comandos_telegram"] and bool(self.token and self.chat)
 
     # ---- comandos recebidos pelo próprio bot ------------------------------
@@ -678,6 +883,15 @@ class Notificador:
                 pz["suprimidos"] += 1
             log.info("PAUSADO (não enviado)\n%s", texto)
             return
+        if not forcar and self.agenda and not self.agenda.dentro() and not (
+                self.agenda.st["ordens_sempre"] and texto.startswith(ORDENS_URGENTES)):
+            fora = self.state.setdefault("fora", {"suprimidos": 0, "fila": []})
+            if texto.startswith(CRITICOS):
+                fora["fila"] = (fora["fila"] + [time.strftime("%d/%m %H:%M ") + texto])[-20:]
+            else:
+                fora["suprimidos"] += 1
+            log.info("FORA DO HORÁRIO (não enviado)\n%s", texto)
+            return
         log.info("ALERTA\n%s", texto)
         if not (self.token and self.chat):
             return
@@ -776,10 +990,6 @@ def ciclo(client, cfg, state, notif, cache):
 
     if resumo_linhas:
         cache["resumo_linhas"], cache["resumo_t"] = resumo_linhas, agora
-    if cfg["resumo_horas"] and agora - state.get("resumo_t", 0) > cfg["resumo_horas"] * 3600 \
-            and resumo_linhas:
-        notif.enviar("📊 Resumo do monitor\n" + "\n".join(resumo_linhas))
-        state["resumo_t"] = agora
 
 # --------------------------------------------------------------------------
 # Ordens e posições abertas
@@ -908,9 +1118,7 @@ class MonitorOrdens:
         self.st["abertas"], self.st["posicoes"] = abertas, posicoes
 
         agora = time.time()
-        if (abertas or posicoes) and \
-                agora - self.st["relatorio_t"] >= self.cfg["relatorio_ordens_min"] * 60:
-            self.st["relatorio_t"] = agora
+        if (abertas or posicoes) and self.notif.agenda and self.notif.agenda.vencido("ordens"):
             self.notif.enviar(self._relatorio(abertas, posicoes, precos))
 
     def _relatorio(self, abertas, posicoes, precos):
@@ -960,6 +1168,10 @@ def status_txt(client, cfg, notif, cache, ordens):
     else:
         cab = "▶️ Alertas ativos"
     linhas = [f"📊 Status do monitor — {cab}"]
+    if notif.agenda:
+        linhas.append(f"🗓️ Horário: {notif.agenda.janela_txt()}" +
+                      ("" if notif.agenda.dentro() else " (agora fora do horário)") +
+                      " — detalhes em /agenda")
     if cache.get("resumo_linhas"):
         quando = time.strftime("%H:%M", time.localtime(cache["resumo_t"]))
         linhas += [f"Análise das {quando}:"] + cache["resumo_linhas"]
@@ -1130,6 +1342,29 @@ Itens:
 🚨 Extremos convergentes: no /tendencia, quando euforia + funding alto + RSI sobrecomprado aparecem juntos (ou o inverso), o risco de reversão brusca é maior.
 
 O regime entra no /tendencia como um dos fatores. Você recebe um aviso quando o regime muda.""",
+"agenda": """📖 AGENDA E FREQUÊNCIA
+
+/agenda mostra o horário de atividade e a frequência de cada relatório.
+
+Horário de atividade (fora dele, nada é enviado; os avisos ficam guardados e chegam quando o horário abrir):
+• /agenda 24/7: sempre ativo
+• /agenda uteis 08:00-18:00: dias úteis, horário comercial
+• /agenda todos 07:00-23:00: todos os dias
+• /agenda seg-sex 09:00-17:30 ou /agenda seg,qua,sex 09:00-17:00
+• /agenda 22:00-06:00: atravessa a meia-noite
+
+Execução de ordens fora do horário:
+• /agenda ordens sempre: ✅ execuções e cancelamentos chegam na hora, mesmo fora do horário (padrão)
+• /agenda ordens guardar: também esperam o horário abrir
+
+Frequência dos relatórios (só dentro do horário):
+• /frequencia analise 30m: 📊 tendência, RSI, suporte e resistência de cada par
+• /frequencia sugestao 1h: 📈 o /tendencia automático. Para escolher as moedas: /frequencia sugestao 1h BTC ETH
+• /frequencia regime 2h: 🌡️ o /regime automático
+• /frequencia ordens 5m: 📋 relatório de ordens abertas
+• Use off para desligar. Ex.: /frequencia sugestao off
+
+Alertas de padrão (🔔) e mudança de regime não têm frequência: chegam quando acontecem.""",
 "comandos": """📖 COMANDOS
 
 /status: análise atual de cada moeda e suas ordens/posições abertas
@@ -1138,17 +1373,21 @@ O regime entra no /tendencia como um dos fatores. Você recebe um aviso quando o
 /retomar: volta a enviar e entrega os avisos de ordens guardados na pausa
 /tendencia: sugestão estatística de alta ou baixa e dos alvos (piso e teto) antes da ruptura. Use /tendencia ETH para outra moeda
 /regime: termômetro diário do mercado (on-chain, sentimento, notícias, juros e dólar)
+/agenda: horário de atividade (ex.: /agenda uteis 08:00-18:00 ou /agenda 24/7)
+/frequencia: frequência de cada relatório (ex.: /frequencia regime 2h)
 /ajuda: esta explicação completa
-/ajuda alertas, termos, ordens, tendencia, regime ou comandos: só uma parte
+/ajuda alertas, termos, ordens, tendencia, regime, agenda ou comandos: só uma parte
 
 Durante a pausa o monitor continua acompanhando tudo. Avisos de execução de ordens nunca se perdem: ficam guardados e chegam quando você retomar.
 
 ⚠️ O monitor identifica padrões, não prevê o futuro e não é recomendação de compra ou venda.""",
 }
-ORDEM_AJUDA = ["alertas", "termos", "ordens", "tendencia", "regime", "comandos"]
+ORDEM_AJUDA = ["alertas", "termos", "ordens", "tendencia", "regime", "agenda", "comandos"]
 SINONIMOS_AJUDA = {"alerta": "alertas", "termo": "termos", "glossario": "termos",
                    "glossário": "termos", "ordem": "ordens", "posicoes": "ordens",
-                   "posições": "ordens", "comando": "comandos", "tendência": "tendencia"}
+                   "posições": "ordens", "comando": "comandos", "tendência": "tendencia",
+                   "frequencia": "agenda", "frequência": "agenda", "horario": "agenda",
+                   "horário": "agenda"}
 
 
 # --------------------------------------------------------------------------
@@ -1405,6 +1644,8 @@ class Regime:
                         self.cache.pop("regime_forcar", False):
                     ult_reg = agora
                     self.calcular()
+                    if self.cache.pop("regime_enviar", False):
+                        self.cache["regime_pronto"] = True
             except Exception:
                 log.exception("Erro na camada de regime")
             time.sleep(10)
@@ -1686,6 +1927,10 @@ def executar_comando(texto, client, cfg, notif, cache, ordens):
             notif.pausar(seg)
     elif cmd == "retomar":
         notif.retomar()
+    elif cmd == "agenda":
+        notif.enviar(notif.agenda.cmd_agenda(arg), forcar=True)
+    elif cmd in ("frequencia", "frequência", "freq"):
+        notif.enviar(notif.agenda.cmd_freq(arg), forcar=True)
     elif cmd == "regime":
         notif.enviar(regime_txt(cache.get("regime")), forcar=True)
     elif cmd in ("tendencia", "tendência"):
@@ -1706,7 +1951,8 @@ def executar_comando(texto, client, cfg, notif, cache, ordens):
         for t in ([tema] if tema in AJUDA else ORDEM_AJUDA):
             notif.enviar(AJUDA[t], forcar=True)
     else:
-        notif.enviar("Comandos do monitor: /status, /tendencia [moeda], /regime, /pausar [30m|2h|1d], "
+        notif.enviar("Comandos do monitor: /status, /tendencia [moeda], /regime, /agenda, /frequencia, "
+                     "/pausar [30m|2h|1d], "
                      "/retomar, /ajuda",
                      forcar=True)
 
@@ -1736,6 +1982,7 @@ def main():
     state_path = APP_DIR / "estado.json"
     state = load_state(state_path)
     notif = Notificador(cfg, state)
+    notif.agenda = agenda = Agenda(cfg, state)
     cache = {"validos": client.valid_symbols(cfg["moeda_cotacao"])}
     log.info("Monitor iniciado (%s)", ", ".join(cfg["intervalos"]))
 
@@ -1755,6 +2002,7 @@ def main():
         log.info("Camada de regime ativa (notícias a cada %s min, regime a cada %s h)",
                  cfg["noticias_min"], cfg["regime_horas"])
     ultimo_ciclo = ultima_ordem = 0
+    estava_dentro = agenda.dentro()
     while True:
         inicio = time.time()
         rodou = processar_comandos(pasta, client, cfg, notif, cache, ordens)
@@ -1776,6 +2024,42 @@ def main():
                 ciclo(client, cfg, state, notif, cache)
             except Exception:
                 log.exception("Erro no ciclo")
+        # Abertura/fechamento do horário de atividade
+        dentro = agenda.dentro()
+        if dentro != estava_dentro:
+            estava_dentro = rodou = dentro
+            if dentro:
+                fora = state.pop("fora", None) or {"suprimidos": 0, "fila": []}
+                txt = (f"☀️ Início do horário de atividade ({agenda.janela_txt()}). "
+                       f"Fora do horário: {fora['suprimidos']} alerta(s) de mercado não enviados.")
+                if fora["fila"]:
+                    txt += "\n\nAvisos guardados:\n\n" + "\n\n".join(fora["fila"])
+                notif.enviar(txt, forcar=True)
+            else:
+                notif.enviar("🌙 Fim do horário de atividade. Alertas ficam guardados até a "
+                             "próxima abertura" + ("; avisos de execução de ordens continuam "
+                             "chegando na hora." if agenda.st["ordens_sempre"] else "."),
+                             forcar=True)
+
+        # Relatórios programados (/frequencia)
+        if cache.get("resumo_linhas") and agenda.vencido("analise"):
+            rodou = True
+            notif.enviar("📊 Análise do monitor\n" + "\n".join(cache["resumo_linhas"]))
+        if cache.get("resumo_linhas") and agenda.vencido("sugestao"):
+            rodou = True
+            for sym in agenda.simbolos_sugestao():
+                try:
+                    notif.enviar(analisar_tendencia(client, cfg, sym, cache))
+                except Exception:
+                    log.exception("Erro na sugestão automática de %s", sym)
+        if agenda.vencido("regime"):
+            rodou = True
+            if cfg["regime"] and not args.once:
+                cache["regime_enviar"] = cache["regime_forcar"] = True
+            else:
+                notif.enviar(regime_txt(cache.get("regime")))
+        if cache.pop("regime_pronto", False):
+            notif.enviar(regime_txt(cache.get("regime")))
         if rodou:
             save_state(state_path, state)
         if args.once:
