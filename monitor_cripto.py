@@ -1175,11 +1175,32 @@ class Notificador:
         self.ler_comandos = cfg["comandos_telegram"] and bool(self.token and self.chat)
 
     # ---- comandos recebidos pelo próprio bot ------------------------------
+    _local = threading.local()
+
+    def _sessao(self):
+        # uma conexão reaproveitada por thread: evita refazer DNS + TLS a cada chamada
+        s = getattr(self._local, "s", None)
+        if s is None:
+            s = self._local.s = requests.Session()
+        return s
+
     def _api(self, metodo, **dados):
         """Chamada ao Telegram respeitando o limite de envio (erro 429)."""
         for tentativa in range(3):
-            r = requests.post(f"https://api.telegram.org/bot{self.token}/{metodo}",
-                              json=dados, timeout=15)
+            t0 = time.time()
+            try:
+                r = self._sessao().post(f"https://api.telegram.org/bot{self.token}/{metodo}",
+                                        json=dados, timeout=(5, 15))
+            except requests.RequestException as e:
+                log.warning("Telegram %s falhou após %.1f s: %s", metodo,
+                            time.time() - t0, type(e).__name__)
+                self._local.s = None                     # descarta conexão ruim
+                if tentativa < 2 and isinstance(e, (requests.ConnectionError, requests.Timeout)):
+                    continue
+                raise
+            dur = time.time() - t0
+            if dur > 2:
+                log.warning("Telegram %s demorou %.1f s", metodo, dur)
             d = r.json()
             if d.get("error_code") == 429 and tentativa < 2:
                 espera = min(int((d.get("parameters") or {}).get("retry_after", 2)), 10)
@@ -1708,6 +1729,7 @@ class Receptor:
 
     def rodar(self):
         while True:
+            t0 = time.time()
             try:
                 for item in coletar_comandos(self.pasta, self.notif):
                     if isinstance(item, dict) and item.get("callback"):
@@ -1717,6 +1739,8 @@ class Receptor:
                     self.fila.put(item)
             except Exception:
                 log.exception("Erro ao receber comandos")
+            if time.time() - t0 > 3:
+                log.warning("Recepção de comandos ficou %.1f s ocupada", time.time() - t0)
             time.sleep(0.5)
 
     def drenar(self, client, cfg, cache, ordens):
