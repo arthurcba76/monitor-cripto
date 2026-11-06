@@ -76,6 +76,7 @@ COMANDOS_MENU = [
     {"command": "status", "description": "Análise atual e posições abertas"},
     {"command": "pausar", "description": "Pausa os alertas (ex.: /pausar 2h)"},
     {"command": "retomar", "description": "Retoma os alertas"},
+    {"command": "tendencia", "description": "Sugestão de direção e alvos (ex.: /tendencia ETH)"},
     {"command": "ajuda", "description": "O que significa cada informação"},
 ]
 
@@ -131,6 +132,7 @@ class Candle:
     c: float
     v: float
     ct: int     # fechamento (ms)
+    tb: float = 0.0   # volume de compras agressivas (taker buy)
 
 
 class BinanceErro(Exception):
@@ -203,7 +205,8 @@ class Binance:
         raw = self.get("/api/v3/klines",
                        {"symbol": symbol, "interval": interval, "limit": limit})
         cs = [Candle(int(k[0]), float(k[1]), float(k[2]), float(k[3]),
-                     float(k[4]), float(k[5]), int(k[6])) for k in raw]
+                     float(k[4]), float(k[5]), int(k[6]),
+                     float(k[9]) if len(k) > 9 else 0.0) for k in raw]
         agora = int(time.time() * 1000)
         if cs and cs[-1].ct > agora:   # vela ainda em formação: fora da análise
             cs.pop()
@@ -1065,23 +1068,241 @@ Tipos de ordem:
 • STOP_LOSS: vende/compra quando o preço passa de um ponto, para limitar perdas
 • TAKE_PROFIT: realiza o lucro quando chega no alvo""",
 
+"tendencia": """📖 COMO LER O /tendencia
+
+Sugestão: ALTA, BAIXA ou LATERAL, com a força (leve, moderada, forte). Vem do "score", de −1 (muito baixista) a +1 (muito altista), que soma vários fatores com pesos fixos.
+
+Alvos antes da ruptura: o teto (resistência) e o piso (suporte) mais próximos. É até onde o preço tende a ir antes de romper para um lado.
+
+Chance de tocar primeiro: pela distância até o teto e até o piso, ajustada pelo score. Ex.: teto 65% quer dizer que, com os dados de agora, é mais provável encostar no teto antes do piso.
+
+Tempo típico: estimativa de quantas horas o preço leva para tocar um dos lados, pela volatilidade recente.
+
+Faixa provável em 24h: onde o preço deve estar daqui a um dia em ~68% dos casos, pela volatilidade.
+
+Fatores:
+• Tendência: direção das médias em cada tempo gráfico
+• RSI: força; extremos contam contra (risco de correção ou repique)
+• Fluxo agressor: % do volume em compras "a mercado" (quem tem pressa de comprar)
+• Livro de ofertas: quanto há de ordens de compra x venda perto do preço
+• Open interest: dinheiro em contratos futuros. Subindo junto com o preço = movimento com força
+• Funding: taxa entre comprados e vendidos no futuro. Muito alta = muitos apostando na alta (sinal contrário)
+• Long/short: proporção de contas compradas x vendidas (extremos = sinal contrário)
+
+⚠️ É uma estimativa, não previsão. Os pesos não foram testados no histórico.""",
 "comandos": """📖 COMANDOS
 
 /status: análise atual de cada moeda e suas ordens/posições abertas
 /pausar: para de enviar alertas até você mandar /retomar
 /pausar 30m, /pausar 2h, /pausar 1d: pausa por um tempo e volta sozinho
 /retomar: volta a enviar e entrega os avisos de ordens guardados na pausa
+/tendencia: sugestão estatística de alta ou baixa e dos alvos (piso e teto) antes da ruptura. Use /tendencia ETH para outra moeda
 /ajuda: esta explicação completa
-/ajuda alertas, /ajuda termos, /ajuda ordens, /ajuda comandos: só uma parte
+/ajuda alertas, /ajuda termos, /ajuda ordens, /ajuda tendencia, /ajuda comandos: só uma parte
 
 Durante a pausa o monitor continua acompanhando tudo. Avisos de execução de ordens nunca se perdem: ficam guardados e chegam quando você retomar.
 
 ⚠️ O monitor identifica padrões, não prevê o futuro e não é recomendação de compra ou venda.""",
 }
-ORDEM_AJUDA = ["alertas", "termos", "ordens", "comandos"]
+ORDEM_AJUDA = ["alertas", "termos", "ordens", "tendencia", "comandos"]
 SINONIMOS_AJUDA = {"alerta": "alertas", "termo": "termos", "glossario": "termos",
                    "glossário": "termos", "ordem": "ordens", "posicoes": "ordens",
-                   "posições": "ordens", "comando": "comandos"}
+                   "posições": "ordens", "comando": "comandos", "tendência": "tendencia"}
+
+
+# --------------------------------------------------------------------------
+# /tendencia: sugestão estatística de direção e alvos dentro da faixa
+# --------------------------------------------------------------------------
+def _clip(x, a=-1.0, b=1.0):
+    return max(a, min(b, x))
+
+
+def _publico(client, path, params, base=BASE_URL):
+    """Dado público opcional: falha vira None, sem derrubar o comando."""
+    try:
+        return client.get(path, params, base=base)
+    except Exception as e:
+        log.info("Dado indisponível %s: %s", path, type(e).__name__)
+        return None
+
+
+def zonas_de(cs, cfg):
+    A = wilder(true_ranges(cs), 14)[-1]
+    topos, fundos = pivots(cs, cfg["pivo_janela"])
+    return build_zones(topos, fundos, A, cfg), A
+
+
+def analisar_tendencia(client, cfg, simbolo):
+    """Retorna o texto da resposta do /tendencia para um par."""
+    quote = cfg["moeda_cotacao"]
+    sym = simbolo.upper()
+    if not sym.endswith(quote):
+        sym += quote
+    fatores, score, peso_total = [], 0.0, 0.0
+
+    def soma(valor, peso, texto):
+        nonlocal score, peso_total
+        score += _clip(valor) * peso
+        peso_total += peso
+        sinal = "+" if valor > 0.1 else "−" if valor < -0.1 else "="
+        fatores.append(f"{sinal} {texto}")
+
+    # 1) Velas e análise técnica de cada intervalo
+    velas, resumo = {}, {}
+    for itv in cfg["intervalos"]:
+        try:
+            cs = client.klines(sym, itv, cfg["velas"])
+        except BinanceErro:
+            return f"Par {sym} não encontrado na Binance. Exemplo: /tendencia BTC"
+        if len(cs) < 80:
+            continue
+        velas[itv] = cs
+        r, _ = analyze(cs, cs[-1].c, cfg, {})
+        resumo[itv] = r
+    if not velas:
+        return f"Sem dados suficientes para {sym}."
+    base_itv = cfg["intervalos"][0]
+    cs = velas[base_itv]
+    preco = float(client.get("/api/v3/ticker/price", {"symbol": sym})["price"])
+
+    peso_itv = 0.35 / len(resumo)
+    for itv, r in resumo.items():
+        v = {"alta": 1, "baixa": -1}.get(r["tendencia"], 0)
+        soma(v, peso_itv, f"Tendência [{itv}]: {r['tendencia']}")
+
+    rsi_v = resumo[base_itv]["rsi"]
+    if rsi_v > 70:
+        soma(-0.5, 0.10, f"RSI [{base_itv}] {rsi_v}: sobrecomprado, risco de correção")
+    elif rsi_v < 30:
+        soma(0.5, 0.10, f"RSI [{base_itv}] {rsi_v}: sobrevendido, chance de repique")
+    else:
+        soma((rsi_v - 50) / 20, 0.10, f"RSI [{base_itv}] {rsi_v}")
+
+    # 2) Fluxo: compras agressivas x vendas agressivas nas últimas 24 velas
+    vol = sum(c.v for c in cs[-24:])
+    if vol > 0 and any(c.tb for c in cs[-24:]):
+        compra = sum(c.tb for c in cs[-24:]) / vol
+        soma((compra - 0.5) * 10, 0.15,
+             f"Fluxo agressor [{base_itv}, 24 velas]: {compra * 100:.0f}% compras")
+
+    # 3) Livro de ofertas: volume de compra x venda até ±1% do preço
+    livro = _publico(client, "/api/v3/depth", {"symbol": sym, "limit": 500})
+    if livro:
+        bid = sum(float(q) for p, q in livro["bids"] if float(p) >= preco * 0.99)
+        ask = sum(float(q) for p, q in livro["asks"] if float(p) <= preco * 1.01)
+        if bid + ask > 0:
+            imb = (bid - ask) / (bid + ask)
+            soma(imb * 2, 0.15, f"Livro de ofertas (±1%): {bid / (bid + ask) * 100:.0f}% do lado da compra")
+
+    # 4) Mercado futuro (público): open interest, funding, long/short
+    oi = _publico(client, "/futures/data/openInterestHist",
+                  {"symbol": sym, "period": "1h", "limit": 5}, base=FAPI_URL)
+    if oi and len(oi) >= 2:
+        o0, o1 = float(oi[0]["sumOpenInterest"]), float(oi[-1]["sumOpenInterest"])
+        d_oi = (o1 / o0 - 1) if o0 else 0
+        d_px = cs[-1].c / cs[-5].c - 1
+        lado = 1 if d_px > 0 else -1
+        if d_oi > 0.005:
+            soma(lado * 0.8, 0.10, f"Open interest {d_oi * 100:+.1f}% em 4h com preço "
+                 f"{'subindo' if lado > 0 else 'caindo'}: dinheiro novo a favor do movimento")
+        elif d_oi < -0.005:
+            soma(lado * 0.3, 0.10, f"Open interest {d_oi * 100:+.1f}% em 4h: posições fechando, "
+                 "movimento perde combustível")
+        else:
+            soma(0, 0.10, "Open interest estável em 4h")
+    prem = _publico(client, "/fapi/v1/premiumIndex", {"symbol": sym}, base=FAPI_URL)
+    if prem and "lastFundingRate" in prem:
+        f = float(prem["lastFundingRate"]) * 100
+        if f > 0.03:
+            soma(-0.6, 0.05, f"Funding {f:.3f}%: muitos comprados alavancados (risco de queda)")
+        elif f < -0.01:
+            soma(0.6, 0.05, f"Funding {f:.3f}%: muitos vendidos alavancados (risco de alta)")
+        else:
+            soma(0, 0.05, f"Funding {f:.3f}%: neutro")
+    ls = _publico(client, "/futures/data/globalLongShortAccountRatio",
+                  {"symbol": sym, "period": "1h", "limit": 1}, base=FAPI_URL)
+    if ls:
+        r_ls = float(ls[-1]["longShortRatio"])
+        v = -0.5 if r_ls > 2 else 0.5 if r_ls < 0.8 else 0
+        soma(v, 0.05, f"Contas long/short: {r_ls:.2f}" +
+             (" (multidão muito comprada: sinal contrário)" if r_ls > 2 else
+              " (multidão muito vendida: sinal contrário)" if r_ls < 0.8 else ""))
+
+    score = score / peso_total if peso_total else 0
+
+    # 5) Alvos: piso e teto mais próximos no intervalo base
+    zonas, A = zonas_de(cs, cfg)
+    res = min((z for z in zonas if z.low > preco), key=lambda z: z.low, default=None)
+    sup = max((z for z in zonas if z.high < preco), key=lambda z: z.high, default=None)
+    rets = [math.log(cs[i].c / cs[i - 1].c) for i in range(len(cs) - 200, len(cs))]
+    sig = (sum(r * r for r in rets) / len(rets) - mean(rets) ** 2) ** 0.5 or 1e-9
+    passos_24h = {"1m": 1440, "3m": 480, "5m": 288, "15m": 96, "30m": 48, "1h": 24,
+                  "2h": 12, "4h": 6, "6h": 4, "8h": 3, "12h": 2, "1d": 1}.get(base_itv, 24)
+    s24 = sig * math.sqrt(passos_24h)
+    alvo_up = res.low if res else preco * math.exp(s24)
+    alvo_dn = sup.high if sup else preco * math.exp(-s24)
+    a, b = math.log(alvo_up / preco), math.log(preco / alvo_dn)
+    p_geo = b / (a + b) if a + b > 0 else 0.5
+    p_geo = min(max(p_geo, 0.02), 0.98)
+    p_up = 1 / (1 + math.exp(-(math.log(p_geo / (1 - p_geo)) + 1.5 * score)))
+    horas = a * b / (sig * sig) / passos_24h * 24 if sig else 0
+
+    forca = abs(score)
+    if forca < 0.15:
+        dir_txt, emoji = "LATERAL / indefinida", "↔️"
+    else:
+        nivel = "leve" if forca < 0.35 else "moderada" if forca < 0.6 else "forte"
+        dir_txt, emoji = (f"ALTA {nivel}", "📈") if score > 0 else (f"BAIXA {nivel}", "📉")
+
+    def zona_alvo(z, lado):
+        if not z:
+            return f"sem {'teto' if lado > 0 else 'piso'} mapeado (alvo pela volatilidade de 24h)"
+        return zona_txt(z)
+
+    def pct(x):
+        return f"{(x / preco - 1) * 100:+.2f}%".replace(".", ",")
+
+    if score >= 0.15 and p_up >= 0.5:
+        leitura = f"viés de alta; valor provável antes da ruptura: o teto em {fmt(alvo_up)}."
+    elif score <= -0.15 and p_up < 0.5:
+        leitura = f"viés de baixa; valor provável antes da ruptura: o piso em {fmt(alvo_dn)}."
+    elif score <= -0.15:
+        leitura = (f"viés de baixa, mas o teto está mais perto: pode encostar em {fmt(alvo_up)} "
+                   f"e ser rejeitado antes de buscar o piso em {fmt(alvo_dn)}.")
+    elif score >= 0.15:
+        leitura = (f"viés de alta, mas o piso está mais perto: pode testar {fmt(alvo_dn)} "
+                   f"antes de buscar o teto em {fmt(alvo_up)}.")
+    else:
+        leitura = f"sem viés claro; tende a oscilar entre {fmt(alvo_dn)} e {fmt(alvo_up)}."
+
+    acima = min((z for z in zonas if res and z.low > res.high), key=lambda z: z.low, default=None)
+    abaixo = max((z for z in zonas if sup and z.high < sup.low), key=lambda z: z.high, default=None)
+    linhas = [
+        f"{emoji} Tendência {sym} — sugestão: {dir_txt} (score {score:+.2f})".replace(".", ","),
+        f"Preço: {fmt(preco)}",
+        "",
+        "Alvos antes da ruptura (intervalo " + base_itv + "):",
+        f"⬆️ Teto: {fmt(alvo_up)} ({pct(alvo_up)}) — {zona_alvo(res, 1)}",
+        f"⬇️ Piso: {fmt(alvo_dn)} ({pct(alvo_dn)}) — {zona_alvo(sup, -1)}",
+        f"Chance estimada de tocar primeiro: teto {p_up * 100:.0f}% | piso {(1 - p_up) * 100:.0f}%",
+        f"Leitura: {leitura}",
+    ]
+    if horas:
+        linhas.append(f"Tempo típico até tocar um dos lados: ~{horas:.0f}h" if horas >= 1
+                      else "Tempo típico até tocar um dos lados: menos de 1h")
+    linhas += [
+        f"Se romper o teto, próximo alvo: {zona_txt(acima) if acima else 'sem zona mapeada'}",
+        f"Se romper o piso, próximo alvo: {zona_txt(abaixo) if abaixo else 'sem zona mapeada'}",
+        f"Faixa provável em 24h (68%): {fmt(preco * math.exp(-s24))} – {fmt(preco * math.exp(s24))}",
+        "",
+        "Fatores considerados:",
+    ] + fatores + [
+        "",
+        "⚠️ Estimativa estatística com os dados deste momento, não previsão nem "
+        "recomendação. Os pesos dos fatores são fixos e não foram testados no "
+        "histórico. Use como mais um elemento de análise. /ajuda tendencia explica cada item.",
+    ]
+    return "\n".join(linhas)
 
 
 def executar_comando(texto, client, cfg, notif, cache, ordens):
@@ -1098,6 +1319,13 @@ def executar_comando(texto, client, cfg, notif, cache, ordens):
             notif.pausar(seg)
     elif cmd == "retomar":
         notif.retomar()
+    elif cmd in ("tendencia", "tendência"):
+        alvo = arg.split()[0] if arg.strip() else (cfg["simbolos_extras"] or ["BTC"])[0]
+        try:
+            notif.enviar(analisar_tendencia(client, cfg, alvo), forcar=True)
+        except Exception as e:
+            log.exception("Erro no /tendencia")
+            notif.enviar(f"⚠️ Erro ao calcular a tendência: {type(e).__name__}", forcar=True)
     elif cmd == "status":
         try:
             notif.enviar(status_txt(client, cfg, notif, cache, ordens), forcar=True)
@@ -1109,7 +1337,8 @@ def executar_comando(texto, client, cfg, notif, cache, ordens):
         for t in ([tema] if tema in AJUDA else ORDEM_AJUDA):
             notif.enviar(AJUDA[t], forcar=True)
     else:
-        notif.enviar("Comandos do monitor: /status, /pausar [30m|2h|1d], /retomar, /ajuda",
+        notif.enviar("Comandos do monitor: /status, /tendencia [moeda], /pausar [30m|2h|1d], "
+                     "/retomar, /ajuda",
                      forcar=True)
 
 

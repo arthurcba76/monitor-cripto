@@ -50,7 +50,8 @@ notebook, um Raspberry Pi ou uma máquina virtual) como serviço do `systemd`. �
 | `/status` | Mostra na hora a análise atual e as ordens ou posições abertas. |
 | `/pausar` | Pausa os alertas até você mandar `/retomar`. Aceita prazo: `/pausar 30m`, `/pausar 2h`, `/pausar 1d`. |
 | `/retomar` | Volta a enviar os alertas e entrega os avisos de ordens que ficaram guardados durante a pausa. |
-| `/ajuda` | Explica em linguagem simples cada alerta, cada termo dos relatórios (suporte, RSI, ATR, pavio…), os avisos de ordens e os comandos. Para ver só uma parte: `/ajuda alertas`, `/ajuda termos`, `/ajuda ordens` ou `/ajuda comandos`. |
+| `/tendencia` | Sugestão estatística de **alta, baixa ou lateral**, com o teto e o piso que o preço tende a alcançar antes de romper, a chance estimada de tocar cada lado primeiro, o tempo típico, a faixa provável em 24h e os fatores usados. Outra moeda: `/tendencia ETH`. |
+| `/ajuda` | Explica em linguagem simples cada alerta, cada termo dos relatórios (suporte, RSI, ATR, pavio…), os avisos de ordens e os comandos. Para ver só uma parte: `/ajuda alertas`, `/ajuda termos`, `/ajuda ordens`, `/ajuda tendencia` ou `/ajuda comandos`. |
 
 O monitor só aceita comandos vindos do `TELEGRAM_CHAT_ID` configurado e ignora
 qualquer outro chat. Durante a pausa ele continua acompanhando tudo: os alertas
@@ -135,6 +136,30 @@ mudar.
 | `relatorio_ordens_min` | `5` | Intervalo do relatório 📋 enquanto houver algo aberto. |
 | `comandos_telegram` | `true` | O próprio monitor lê os comandos enviados ao bot. |
 | `pasta_comandos` | `""` | Pasta onde outro programa pode gravar comandos (`*.cmd`). |
+
+### Como o `/tendencia` calcula
+
+O comando soma fatores com pesos fixos, num *score* de −1 a +1:
+
+| Fator | Peso | Fonte |
+|---|---|---|
+| Tendência de cada intervalo (médias 20/50 + inclinação) | 35% | velas |
+| RSI (extremos contam contra: risco de correção ou repique) | 10% | velas |
+| Fluxo agressor: % do volume em compras a mercado, últimas 24 velas | 15% | velas (*taker buy volume*) |
+| Livro de ofertas: compra x venda até ±1% do preço | 15% | `/api/v3/depth` |
+| Open interest em 4h, combinado com a direção do preço | 10% | Futuros (público) |
+| Funding rate (extremos = sinal contrário) | 5% | Futuros (público) |
+| Proporção de contas long/short (extremos = sinal contrário) | 5% | Futuros (público) |
+
+Os alvos são o teto e o piso mais próximos no primeiro intervalo de `intervalos`.
+A chance de tocar cada lado primeiro parte da distância até eles (modelo de passeio
+aleatório) e é ajustada pelo score. O tempo típico e a faixa de 24h vêm da
+volatilidade das últimas 200 velas. Se o par não tiver Futuros, esses fatores
+são ignorados.
+
+> Os pesos são escolhas de projeto e **não foram calibrados com backtest**. Trate
+> o resultado como mais um elemento de análise. Contribuições com validação
+> histórica são muito bem-vindas.
 
 ### Como as zonas são encontradas
 
