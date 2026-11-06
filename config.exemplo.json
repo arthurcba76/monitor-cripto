@@ -34,6 +34,7 @@
   "freq_regime_min": 0,
   "sugestao_simbolos": [],
   "comandos_telegram": true,
+  "silencio_config_min": 5,
   "pasta_comandos": "",
   "regime": true,
   "regime_horas": 6,

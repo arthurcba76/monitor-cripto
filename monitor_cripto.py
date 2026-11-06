@@ -77,6 +77,7 @@ DEFAULT_CONFIG = {
     "sugestao_simbolos": [],          # pares da sugestão automática (vazio = simbolos_extras)
     "comandos_telegram": True,        # o próprio monitor lê /status, /pausar, /retomar
                                       # (use false se o bot já é lido por outro programa)
+    "silencio_config_min": 5,         # durante o /config, outros avisos esperam (renova a cada clique)
     "pasta_comandos": "",             # alternativa: outro programa grava *.cmd aqui;
                                       # vazio = ./comandos
     "regime": True,                   # camada diária: on-chain, sentimento, notícias, macro
@@ -886,6 +887,7 @@ class Configurador:
     def abrir(self):
         texto = config_txt(self.cfg, self.ag, self.cache) + "\n\nQuer alterar alguma coisa?"
         teclado = [[_bt("✏️ Sim, alterar", "menu"), _bt("👍 Não, está bom", "fim")]]
+        self.notif.silenciar(self.cfg["silencio_config_min"] * 60)
         mid = self.notif.enviar_teclado(texto, teclado)
         self.wz.clear()
         self.wz.update({"msg": mid, "item": None, "passo": None, "dados": {}})
@@ -1058,6 +1060,8 @@ class Configurador:
             else:
                 self.notif.responder_cb(cb_id, txt)
 
+        if w and w.get("msg") == msg_id:
+            self.notif.silenciar(self.cfg["silencio_config_min"] * 60)   # renova a cada clique
         if not w or w.get("msg") != msg_id:
             if respondido:
                 self.notif.enviar("⌛ Este menu expirou. Mande /config de novo.", forcar=True)
@@ -1072,6 +1076,7 @@ class Configurador:
             w.clear()
             self.notif.editar(msg_id, config_txt(self.cfg, self.ag, self.cache) +
                               "\n\n👍 Configuração concluída. Para mudar de novo: /config")
+            self.notif.fim_silencio(forcado=True)
             return
         if acao == "menu":
             w.update({"item": None, "passo": None, "dados": {}})
@@ -1171,9 +1176,39 @@ class Notificador:
 
     # ---- comandos recebidos pelo próprio bot ------------------------------
     def _api(self, metodo, **dados):
-        r = requests.post(f"https://api.telegram.org/bot{self.token}/{metodo}",
-                          json=dados, timeout=15)
-        return r.json()
+        """Chamada ao Telegram respeitando o limite de envio (erro 429)."""
+        for tentativa in range(3):
+            r = requests.post(f"https://api.telegram.org/bot{self.token}/{metodo}",
+                              json=dados, timeout=15)
+            d = r.json()
+            if d.get("error_code") == 429 and tentativa < 2:
+                espera = min(int((d.get("parameters") or {}).get("retry_after", 2)), 10)
+                log.warning("Telegram pediu para esperar %ss (limite de envio) em %s",
+                            espera, metodo)
+                time.sleep(espera)
+                continue
+            return d
+        return d
+
+    # ---- silêncio enquanto o /config está aberto -----------------------------
+    def silencio_ativo(self):
+        return time.time() < self.state.get("silencio_ate", 0)
+
+    def silenciar(self, segundos=300):
+        self.state["silencio_ate"] = time.time() + segundos
+
+    def fim_silencio(self, forcado=False):
+        """Encerra o silêncio e entrega o que ficou guardado (se houver)."""
+        if not forcado and self.silencio_ativo():
+            return
+        self.state.pop("silencio_ate", None)
+        sl = self.state.pop("silencio", None)
+        if sl and (sl["suprimidos"] or sl["fila"]):
+            txt = (f"🔔 Durante a configuração: {sl['suprimidos']} aviso(s) de mercado "
+                   "não enviados (use /status para ver a situação atual).")
+            if sl["fila"]:
+                txt += "\n\nAvisos guardados:\n\n" + "\n\n".join(sl["fila"])
+            self.enviar(txt, forcar=True)
 
     def enviar_teclado(self, texto, teclado):
         if not (self.token and self.chat):
@@ -1191,10 +1226,13 @@ class Notificador:
             log.info("MENU\n%s", texto)
             return
         try:
+            t0 = time.time()
             d = self._api("editMessageText", chat_id=self.chat, message_id=msg_id,
                           text=texto[:4000], reply_markup={"inline_keyboard": teclado or []})
             if not d.get("ok") and "not modified" not in str(d.get("description")):
-                log.warning("Telegram recusou a edição: %s", d.get("description"))
+                log.warning("Telegram recusou a edição do menu: %s", d.get("description"))
+            elif time.time() - t0 > 2:
+                log.warning("Edição do menu demorou %.1f s no Telegram", time.time() - t0)
         except (requests.RequestException, ValueError) as e:
             log.error("Falha ao editar menu: %s", type(e).__name__)
 
@@ -1300,6 +1338,14 @@ class Notificador:
         return True
 
     def enviar(self, texto, forcar=False):
+        if not forcar and self.silencio_ativo():
+            sl = self.state.setdefault("silencio", {"suprimidos": 0, "fila": []})
+            if texto.startswith(CRITICOS):
+                sl["fila"] = (sl["fila"] + [time.strftime("%d/%m %H:%M ") + texto])[-20:]
+            else:
+                sl["suprimidos"] += 1
+            log.info("SILÊNCIO DO /config (não enviado)\n%s", texto)
+            return
         if not forcar and self.pausado():
             pz = self.state["pausa"]
             if texto.startswith(CRITICOS):
@@ -1327,10 +1373,8 @@ class Notificador:
         if len(texto) > 4000:                       # limite do Telegram: 4096
             texto = texto[:3990] + "\n[…]"
         try:
-            r = requests.post(f"https://api.telegram.org/bot{self.token}/sendMessage",
-                              json={"chat_id": self.chat, "text": texto,
-                                    "disable_web_page_preview": True}, timeout=15)
-            d = r.json()
+            d = self._api("sendMessage", chat_id=self.chat, text=texto,
+                          disable_web_page_preview=True)
             if not d.get("ok"):
                 log.error("Telegram recusou a mensagem: %s %s",
                           d.get("error_code"), d.get("description"))
@@ -1669,6 +1713,7 @@ class Receptor:
                     if isinstance(item, dict) and item.get("callback"):
                         self.notif.responder_cb(item["callback"].get("id"))
                         item["callback"]["respondido"] = True
+                        item["callback"]["recebido"] = time.time()
                     self.fila.put(item)
             except Exception:
                 log.exception("Erro ao receber comandos")
@@ -2399,7 +2444,8 @@ def executar_comando(texto, client, cfg, notif, cache, ordens):
     if isinstance(texto, dict):
         cb = texto.get("callback") or {}
         if notif.config and str(cb.get("data", "")).startswith("cfg|"):
-            log.info("Botão: %s", cb["data"])
+            espera = time.time() - cb.get("recebido", time.time())
+            log.info("Botão: %s (executado %.1f s após chegar)", cb["data"], espera)
             try:
                 notif.config.on_callback(cb.get("id"), cb.get("message_id"), cb["data"][4:],
                                          bool(cb.get("respondido")))
@@ -2532,7 +2578,7 @@ def main():
                 log.exception("Erro no ciclo")
         # Abertura/fechamento do horário de atividade
         dentro = agenda.dentro()
-        if dentro != estava_dentro:
+        if dentro != estava_dentro and not notif.silencio_ativo():
             estava_dentro = rodou = dentro
             if dentro:
                 fora = state.pop("fora", None) or {"suprimidos": 0, "fila": []}
@@ -2546,6 +2592,11 @@ def main():
                              "próxima abertura" + ("; avisos de execução de ordens continuam "
                              "chegando na hora." if agenda.st["ordens_sempre"] else "."),
                              forcar=True)
+
+        # Fim do silêncio do /config por tempo (menu abandonado)
+        if "silencio_ate" in state and not notif.silencio_ativo():
+            notif.fim_silencio()
+            rodou = True
 
         # Relatórios programados (/frequencia)
         if cache.get("resumo_linhas") and agenda.vencido("analise"):
