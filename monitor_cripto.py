@@ -598,7 +598,7 @@ SINONIMOS_FREQ = {"análise": "analise", "resumo": "analise", "sugestão": "suge
 
 
 def _hm(txt):
-    h, _, m = txt.strip().partition(":")
+    h, _, m = txt.strip().rstrip("h").partition(":")
     h, m = int(h), int(m or 0)
     if not (0 <= h <= 24 and 0 <= m < 60):
         raise ValueError
@@ -634,9 +634,18 @@ class Agenda:
     @staticmethod
     def _parse_janela(txt):
         t = txt.strip().lower()
-        if t in ("24/7", "24x7", "sempre", "continuo", "contínuo", "integral"):
+        if t in ("24/7", "24x7", "24h", "sempre", "continuo", "contínuo", "integral"):
             return None
+        # tolera variações: "07:30- 22:00", "7h30 às 22h", "07:30 22:00", "seg - sex"
+        t = t.replace("–", "-").replace("—", "-").replace("úteis", "uteis")
+        t = re.sub(r"\s+(?:às|as|a|até|ate)\s+", "-", t)
+        t = re.sub(r"\s*-\s*", "-", t)
+        t = re.sub(r"(\d)h(\d{2})", r"\1:\2", t)
+        t = re.sub(r"(\d)h\b", r"\1:00", t)
         partes = t.split()
+        hora = re.compile(r"^\d{1,2}(:\d{2})?$")
+        if len(partes) >= 2 and hora.match(partes[-1]) and hora.match(partes[-2]):
+            partes = partes[:-2] + [partes[-2] + "-" + partes[-1]]
         if len(partes) == 1 and "-" in partes[0] and ":" in partes[0]:
             partes = ["todos"] + partes
         if len(partes) != 2:
