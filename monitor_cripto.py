@@ -99,6 +99,7 @@ COMANDOS_MENU = [
     {"command": "retomar", "description": "Retoma os alertas"},
     {"command": "tendencia", "description": "Sugestão de direção e alvos (ex.: /tendencia ETH)"},
     {"command": "regime", "description": "Termômetro diário: on-chain, sentimento, macro"},
+    {"command": "config", "description": "Ver e alterar a configuração com botões"},
     {"command": "agenda", "description": "Horário de atividade (ex.: /agenda uteis 08:00-18:00)"},
     {"command": "frequencia", "description": "Frequência dos relatórios (ex.: /frequencia regime 2h)"},
     {"command": "ajuda", "description": "O que significa cada informação"},
@@ -582,27 +583,38 @@ def analyze(cs, price, cfg, st):
 # --------------------------------------------------------------------------
 
 # --------------------------------------------------------------------------
-# Agenda: horário de atividade e frequência de cada relatório (ajustável
-# pelo Telegram com /agenda e /frequencia; fica salvo no estado)
+# Agenda: horário geral, horário próprio por item e frequência dos relatórios
+# (ajustável pelo Telegram: /config com botões, ou /agenda e /frequencia)
 # --------------------------------------------------------------------------
 DIAS = ["seg", "ter", "qua", "qui", "sex", "sab", "dom"]
-TIPOS_FREQ = {
-    "analise": "📊 Análise (tendência, RSI, suporte e resistência de cada par)",
-    "sugestao": "📈 Sugestão de tendência (/tendencia automático)",
-    "regime": "🌡️ Regime de mercado (/regime automático)",
-    "ordens": "📋 Relatório de ordens/posições abertas",
+# item: (descrição, é periódico?)
+ITENS = {
+    "analise": ("📊 Análise periódica", True),
+    "sugestao": ("📈 Sugestão de tendência", True),
+    "regime": ("🌡️ Regime periódico", True),
+    "ordens": ("📋 Relatório de ordens abertas", True),
+    "padrao": ("🔔 Alertas de padrão", False),
+    "carteira": ("💼 Variação da carteira", False),
+    "avisos_ordens": ("🧾 Execução de ordens", False),
+    "regime_mudanca": ("🌡️ Aviso de mudança de regime", False),
 }
+TIPOS_FREQ = {k: v[0] for k, v in ITENS.items() if v[1]}
 SINONIMOS_FREQ = {"análise": "analise", "resumo": "analise", "sugestão": "sugestao",
                   "tendencia": "sugestao", "tendência": "sugestao", "ordem": "ordens",
                   "posicoes": "ordens", "posições": "ordens"}
+OPCOES_FREQ = [5, 15, 30, 60, 120, 240, 360, 720, 1440]
 
 
 def _hm(txt):
     h, _, m = txt.strip().rstrip("h").partition(":")
     h, m = int(h), int(m or 0)
-    if not (0 <= h <= 24 and 0 <= m < 60):
+    if not (0 <= h <= 24 and 0 <= m < 60) or h * 60 + m > 1440:
         raise ValueError
     return h * 60 + m
+
+
+def _hm_txt(m):
+    return f"{m // 60:02d}:{m % 60:02d}"
 
 
 def _dur_txt(minutos):
@@ -613,6 +625,33 @@ def _dur_txt(minutos):
     if minutos % 60 == 0:
         return f"a cada {minutos // 60}h"
     return f"a cada {minutos} min"
+
+
+def _dentro_j(j, t=None):
+    """j: None = sempre; dict = {dias, inicio, fim} em minutos do dia."""
+    if not j:
+        return True
+    lt = time.localtime(t or time.time())
+    minuto, dia = lt.tm_hour * 60 + lt.tm_min, lt.tm_wday
+    if j["inicio"] <= j["fim"]:
+        return dia in j["dias"] and j["inicio"] <= minuto < j["fim"]
+    if minuto >= j["inicio"]:                # janela que atravessa a meia-noite
+        return dia in j["dias"]
+    return minuto < j["fim"] and (dia - 1) % 7 in j["dias"]
+
+
+def _janela_txt(j):
+    if not j:
+        return "24/7"
+    if j["dias"] == [0, 1, 2, 3, 4]:
+        d = "dias úteis"
+    elif j["dias"] == list(range(7)):
+        d = "todos os dias"
+    elif j["dias"] == [5, 6]:
+        d = "fim de semana"
+    else:
+        d = ", ".join(DIAS[x] for x in j["dias"])
+    return f"{d}, {_hm_txt(j['inicio'])}–{_hm_txt(j['fim'])}"
 
 
 class Agenda:
@@ -629,8 +668,12 @@ class Agenda:
             f.setdefault(k, v)
         self.st.setdefault("ultimo", {})
         self.st.setdefault("simbolos_sugestao", list(cfg["sugestao_simbolos"]))
+        itens = self.st.setdefault("itens", {})
+        for k in ITENS:
+            # janela: None = usa o horário geral; "24/7" = sempre; dict = própria
+            itens.setdefault(k, {"ativo": True, "janela": None})
 
-    # ---- janela de atividade --------------------------------------------
+    # ---- janelas ----------------------------------------------------------
     @staticmethod
     def _parse_janela(txt):
         t = txt.strip().lower()
@@ -646,12 +689,12 @@ class Agenda:
         hora = re.compile(r"^\d{1,2}(:\d{2})?$")
         if len(partes) >= 2 and hora.match(partes[-1]) and hora.match(partes[-2]):
             partes = partes[:-2] + [partes[-2] + "-" + partes[-1]]
-        if len(partes) == 1 and "-" in partes[0] and ":" in partes[0]:
+        if len(partes) == 1 and "-" in partes[0] and re.match(r"^\d", partes[0]):
             partes = ["todos"] + partes
         if len(partes) != 2:
             raise ValueError
         dias_txt, horas = partes
-        if dias_txt in ("uteis", "úteis", "util", "útil"):
+        if dias_txt in ("uteis", "util", "útil"):
             dias = [0, 1, 2, 3, 4]
         elif dias_txt in ("todos", "diario", "diário", "todo"):
             dias = list(range(7))
@@ -669,76 +712,73 @@ class Agenda:
         ini, _, fim = horas.partition("-")
         return {"dias": dias, "inicio": _hm(ini), "fim": _hm(fim)}
 
-    def dentro(self, t=None):
-        j = self.st["janela"]
-        if not j:
-            return True
-        lt = time.localtime(t or time.time())
-        minuto, dia = lt.tm_hour * 60 + lt.tm_min, lt.tm_wday
-        if j["inicio"] <= j["fim"]:
-            return dia in j["dias"] and j["inicio"] <= minuto < j["fim"]
-        # janela que atravessa a meia-noite (ex.: 22:00-06:00)
-        if minuto >= j["inicio"]:
-            return dia in j["dias"]
-        return minuto < j["fim"] and (dia - 1) % 7 in j["dias"]
+    def janela_de(self, item=None):
+        if item is None:
+            return self.st["janela"]
+        j = self.st["itens"][item]["janela"]
+        return self.st["janela"] if j is None else (None if j == "24/7" else j)
 
-    def janela_txt(self):
-        j = self.st["janela"]
-        if not j:
-            return "24/7 (sempre ativo)"
-        if j["dias"] == [0, 1, 2, 3, 4]:
-            d = "dias úteis"
-        elif j["dias"] == list(range(7)):
-            d = "todos os dias"
-        else:
-            d = ", ".join(DIAS[x] for x in j["dias"])
-        hm = lambda m: f"{m // 60:02d}:{m % 60:02d}"
-        return f"{d}, {hm(j['inicio'])}–{hm(j['fim'])}"
+    def dentro(self, item=None, t=None):
+        return _dentro_j(self.janela_de(item), t)
 
-    # ---- frequências ------------------------------------------------------
+    def janela_txt(self, item=None):
+        if item is not None:
+            j = self.st["itens"][item]["janela"]
+            if j is None:
+                return "horário geral"
+            return "24/7" if j == "24/7" else _janela_txt(j)
+        return _janela_txt(self.st["janela"]) + (" (sempre ativo)" if not self.st["janela"] else "")
+
+    # ---- itens e frequências ---------------------------------------------
+    def ativo(self, item):
+        if ITENS[item][1]:
+            return self.freq(item) > 0
+        return self.st["itens"][item]["ativo"]
+
     def freq(self, tipo):
         return self.st["freq"].get(tipo, 0)
 
     def vencido(self, tipo, agora=None):
-        """True se o relatório está na hora (e marca como enviado)."""
+        """True se o relatório periódico está na hora (e marca como enviado)."""
         agora = agora or time.time()
         f = self.freq(tipo)
-        if not f or not self.dentro(agora):
+        if not f or not self.dentro(tipo, agora):
             return False
         if agora - self.st["ultimo"].get(tipo, 0) < f * 60:
             return False
         self.st["ultimo"][tipo] = agora
         return True
 
+    def item_txt(self, k):
+        desc, periodico = ITENS[k]
+        if not self.ativo(k):
+            return f"{desc}: desligado"
+        partes = [self.janela_txt(k)]
+        if periodico:
+            partes.append(_dur_txt(self.freq(k)))
+            if k == "sugestao":
+                partes.append(", ".join(self.simbolos_sugestao()))
+            if k == "ordens":
+                partes.append("só com algo aberto")
+        if k == "avisos_ordens" and self.st["ordens_sempre"]:
+            partes = ["sempre na hora, mesmo fora do horário"]
+        return f"{desc}: " + " | ".join(partes)
+
     def texto(self):
         linhas = ["🗓️ Agenda do monitor",
-                  f"Horário de atividade: {self.janela_txt()}" +
-                  ("" if self.dentro() else "  (agora: FORA do horário)"),
-                  "Avisos de execução de ordens fora do horário: " +
-                  ("enviados na hora" if self.st["ordens_sempre"] else "guardados até o horário abrir"),
-                  "", "Frequência dos relatórios:"]
-        for k, desc in TIPOS_FREQ.items():
-            extra = ""
-            if k == "sugestao" and self.freq(k):
-                extra = " — " + ", ".join(self.simbolos_sugestao())
-            if k == "ordens":
-                extra = " (só enquanto houver algo aberto)"
-            linhas.append(f"• {desc}: {_dur_txt(self.freq(k))}{extra}")
-        linhas += ["",
-                   "Alertas de padrão (🔔), mudança de regime e avisos de ordens chegam quando "
-                   "acontecem, dentro do horário.",
-                   "",
-                   "Ajustar: /agenda 24/7 | /agenda uteis 08:00-18:00 | "
-                   "/agenda seg,qua,sex 09:00-17:00 | /agenda ordens sempre|guardar",
-                   "/frequencia regime 2h | /frequencia analise 30m | "
-                   "/frequencia sugestao 1h BTC ETH | /frequencia ordens 5m | "
-                   "/frequencia sugestao off"]
+                  f"Horário geral: {self.janela_txt()}" +
+                  ("" if self.dentro() else "  (agora: FORA do horário)"), ""]
+        linhas += ["• " + self.item_txt(k) for k in ITENS]
+        linhas += ["", "Para ajustar com botões: /config",
+                   "Ou por texto: /agenda uteis 08:00-18:00 | /agenda 24/7 | "
+                   "/agenda ordens sempre|guardar | /frequencia regime 2h | "
+                   "/frequencia sugestao 1h BTC ETH | /frequencia analise off"]
         return "\n".join(linhas)
 
     def simbolos_sugestao(self):
         return self.st["simbolos_sugestao"] or list(self.cfg["simbolos_extras"]) or ["BTC"]
 
-    # ---- comandos ---------------------------------------------------------
+    # ---- comandos de texto -----------------------------------------------
     def cmd_agenda(self, arg):
         a = arg.strip().lower()
         if not a:
@@ -754,9 +794,10 @@ class Agenda:
             self.st["janela"] = self._parse_janela(a)
         except (ValueError, IndexError):
             return ("Não entendi. Exemplos:\n/agenda 24/7\n/agenda uteis 08:00-18:00\n"
-                    "/agenda todos 07:00-23:00\n/agenda seg-sex 09:00-17:30\n"
-                    "/agenda seg,qua,sex 09:00-17:00\n/agenda 22:00-06:00")
-        return "✅ Horário de atividade: " + self.janela_txt() + \
+                    "/agenda todos 07:30-22:00\n/agenda seg-sex 09:00-17:30\n"
+                    "/agenda seg,qua,sex 09:00-17:00\n/agenda 22:00-06:00\n"
+                    "Ou use /config para escolher com botões.")
+        return "✅ Horário geral: " + self.janela_txt() + \
             ("" if self.dentro() else "\n(agora está fora do horário; alertas ficam guardados)")
 
     def cmd_freq(self, arg):
@@ -784,6 +825,316 @@ class Agenda:
         return f"✅ {TIPOS_FREQ[tipo]}: {_dur_txt(minutos)}{extra}"
 
 
+def categoria_msg(texto):
+    """Classifica uma mensagem pelo início, para aplicar liga/desliga e horário do item."""
+    if texto.startswith("🔔"):
+        return "padrao"
+    if texto.startswith("💼"):
+        return "carteira"
+    if texto.startswith(ORDENS_URGENTES):
+        return "avisos_ordens"
+    if texto.startswith("📋"):
+        return "ordens"
+    if texto.startswith("📊 Análise"):
+        return "analise"
+    if texto.startswith(("📈 Tendência", "📉 Tendência", "↔️ Tendência")):
+        return "sugestao"
+    if texto.startswith("🌡️ Mudança"):
+        return "regime_mudanca"
+    if texto.startswith("🌡️ Regime"):
+        return "regime"
+    return None
+
+
+def config_txt(cfg, agenda, cache):
+    simbolos = cache.get("simbolos") or cfg["simbolos_extras"]
+    linhas = ["⚙️ Configuração do monitor", "", "O que está sendo verificado:",
+              f"• Moedas: {', '.join(simbolos)}" +
+              (" (carteira + extras)" if cfg["usar_carteira"] else ""),
+              f"• Tempos gráficos: {', '.join(cfg['intervalos'])}; "
+              f"análise a cada {cfg['intervalo_verificacao_s']} s",
+              "• Ordens e posições: " + (f"Spot{' + Futuros' if cfg['monitorar_futuros'] else ''}, "
+                                        f"a cada {cfg['intervalo_ordens_s']} s"
+                                        if cfg["monitorar_ordens"] else "desligado"),
+              "• Regime diário: " + (f"on-chain, Fear & Greed, juros, dólar e notícias "
+                                     f"({cfg['ollama_modelo']}); recálculo a cada "
+                                     f"{cfg['regime_horas']} h, notícias a cada "
+                                     f"{cfg['noticias_min']} min" if cfg["regime"] else "desligado"),
+              "", f"🗓️ Horário geral: {agenda.janela_txt()}" +
+              ("" if agenda.dentro() else " (agora fora do horário)"),
+              "", "Categorias de aviso (estado | horário | frequência):"]
+    linhas += ["• " + agenda.item_txt(k) for k in ITENS]
+    return "\n".join(linhas)
+
+
+# --------------------------------------------------------------------------
+# /config: assistente com botões (inline keyboard) passo a passo
+# --------------------------------------------------------------------------
+def _bt(texto, dado):
+    return {"text": texto, "callback_data": "cfg|" + dado}
+
+
+class Configurador:
+    def __init__(self, cfg, agenda, notif, cache):
+        self.cfg, self.ag, self.notif, self.cache = cfg, agenda, notif, cache
+
+    @property
+    def wz(self):
+        return self.ag.st.setdefault("assistente", {})
+
+    def abrir(self):
+        texto = config_txt(self.cfg, self.ag, self.cache) + "\n\nQuer alterar alguma coisa?"
+        teclado = [[_bt("✏️ Sim, alterar", "menu"), _bt("👍 Não, está bom", "fim")]]
+        mid = self.notif.enviar_teclado(texto, teclado)
+        self.wz.clear()
+        self.wz.update({"msg": mid, "item": None, "passo": None, "dados": {}})
+
+    # ---- telas --------------------------------------------------------------
+    def tela_menu(self, aviso=""):
+        linhas = ([aviso, ""] if aviso else []) + ["O que você quer ajustar?", "",
+                                                   f"🗓️ Horário geral: {self.ag.janela_txt()}"]
+        linhas += ["• " + self.ag.item_txt(k) for k in ITENS]
+        tec = [[_bt("🗓️ Horário geral", "item:geral")]]
+        ks = list(ITENS)
+        for i in range(0, len(ks), 2):
+            tec.append([_bt(ITENS[k][0], f"item:{k}") for k in ks[i:i + 2]])
+        tec.append([_bt("🪙 Moedas da sugestão", "item:moedas")])
+        tec.append([_bt("✅ Concluir", "fim")])
+        return "\n".join(linhas), tec
+
+    def tela(self):
+        w, d = self.wz, self.wz["dados"]
+        item, passo = w["item"], w["passo"]
+        nome = "🗓️ Horário geral" if item == "geral" else \
+            "🪙 Moedas da sugestão" if item == "moedas" else ITENS[item][0]
+        rodape = [_bt("⬅️ Voltar ao menu", "menu"), _bt("❌ Cancelar", "fim")]
+        if passo == "ativo":
+            return (f"{nome}\n\nPasso 1: ligado ou desligado?",
+                    [[_bt("🟢 Ligado", "ativo:1"), _bt("⚪ Desligado", "ativo:0")], rodape])
+        if passo == "dias":
+            sel = d.setdefault("dias", list(range(7)))
+            tec = [[_bt(("✅ " if i in sel else "▫️ ") + DIAS[i], f"dia:{i}") for i in range(r, min(r + 4, 7))]
+                   for r in (0, 4)]
+            tec.append([_bt("Todos", "pre:todos"), _bt("Dias úteis", "pre:uteis"),
+                        _bt("Fim de semana", "pre:fds")])
+            extra = [_bt("♾️ 24/7", "sempre")]
+            if item != "geral":
+                extra.insert(0, _bt("🕘 Usar horário geral", "geral"))
+            tec.append(extra)
+            tec.append([_bt("Próximo ➡️", "prox")])
+            tec.append(rodape)
+            return (f"{nome}\n\nPasso {self._n('dias')}: em quais dias da semana?\n"
+                    "Toque para marcar ou desmarcar.", tec)
+        if passo in ("ini_h", "fim_h"):
+            ini = passo == "ini_h"
+            horas = range(0, 24) if ini else range(1, 25)
+            hs = list(horas)
+            tec = [[_bt(f"{h:02d}", f"h:{h}") for h in hs[i:i + 6]] for i in range(0, len(hs), 6)]
+            tec.append(rodape)
+            return (f"{nome}\n\nPasso {self._n(passo)}: " +
+                    ("a partir de que hora?" if ini else
+                     f"até que hora? (início {_hm_txt(d['inicio'])})"), tec)
+        if passo in ("ini_m", "fim_m"):
+            base = d["inicio"] if passo == "ini_m" else d["fim"]
+            h = base // 60
+            mins = [0] if h == 24 else [0, 15, 30, 45]
+            tec = [[_bt(f"{h:02d}:{m:02d}", f"m:{m}") for m in mins], rodape]
+            return (f"{nome}\n\nPasso {self._n(passo)}: minutos", tec)
+        if passo == "freq":
+            ops = OPCOES_FREQ if item != "ordens" else [1, 5, 10, 15, 30, 60]
+            bts = [_bt(_dur_txt(m).replace("a cada ", ""), f"f:{m}") for m in ops]
+            tec = [bts[i:i + 3] for i in range(0, len(bts), 3)] + [rodape]
+            return (f"{nome}\n\nPasso {self._n('freq')}: com que frequência?", tec)
+        if passo == "ordens_fora":
+            return (f"{nome}\n\nPasso {self._n('ordens_fora')}: fora do horário, as execuções "
+                    "de ordens devem chegar na hora?",
+                    [[_bt("⚡ Sim, sempre na hora", "of:1"), _bt("⏳ Não, guardar", "of:0")],
+                     rodape])
+        if passo == "moedas":
+            sel = d.setdefault("moedas", list(self.ag.simbolos_sugestao()))
+            opcoes = sorted(set((self.cache.get("simbolos") or []) +
+                                [s if s.endswith(self.cfg["moeda_cotacao"]) else s + self.cfg["moeda_cotacao"]
+                                 for s in sel + list(self.cfg["simbolos_extras"])]))
+            norm = lambda s: s if s.endswith(self.cfg["moeda_cotacao"]) else s + self.cfg["moeda_cotacao"]
+            sel_n = [norm(s) for s in sel]
+            bts = [_bt(("✅ " if s in sel_n else "▫️ ") + s.replace(self.cfg["moeda_cotacao"], ""),
+                       f"moeda:{s}") for s in opcoes[:24]]
+            tec = [bts[i:i + 3] for i in range(0, len(bts), 3)]
+            tec.append([_bt("Próximo ➡️", "prox")])
+            tec.append(rodape)
+            return (f"{nome}\n\nQuais moedas a sugestão automática deve analisar?\n"
+                    "(outras: /frequencia sugestao 1h BTC ETH SOL)", tec)
+        if passo == "confirmar":
+            return (f"{nome}\n\nConfira:\n{self._resumo()}",
+                    [[_bt("💾 Salvar", "salvar"), _bt("↩️ Recomeçar", "recomecar")], rodape])
+        return self.tela_menu()
+
+    def _passos(self):
+        item, d = self.wz["item"], self.wz["dados"]
+        if item == "moedas":
+            return ["moedas", "confirmar"]
+        p = [] if item == "geral" else ["ativo"]
+        if item != "geral" and d.get("ativo") is False:
+            return p + ["confirmar"]
+        p.append("dias")
+        if d.get("modo") == "custom":
+            p += ["ini_h", "ini_m", "fim_h", "fim_m"]
+        if item != "geral" and ITENS[item][1]:
+            p.append("freq")
+        if item in ("geral", "avisos_ordens"):
+            p.append("ordens_fora")
+        return p + ["confirmar"]
+
+    def _n(self, passo):
+        ps = self._passos()
+        return f"{ps.index(passo) + 1} de {len(ps)}" if passo in ps else "?"
+
+    def _avancar(self):
+        ps = self._passos()
+        i = ps.index(self.wz["passo"]) if self.wz["passo"] in ps else -1
+        self.wz["passo"] = ps[min(i + 1, len(ps) - 1)]
+
+    def _janela_nova(self):
+        d = self.wz["dados"]
+        if d.get("modo") == "geral":
+            return None
+        if d.get("modo") == "sempre":
+            return "24/7"
+        return {"dias": sorted(d["dias"]), "inicio": d["inicio"], "fim": d["fim"]}
+
+    def _resumo(self):
+        item, d = self.wz["item"], self.wz["dados"]
+        if item == "moedas":
+            return "Moedas: " + ", ".join(d["moedas"])
+        if item != "geral" and d.get("ativo") is False:
+            return "Desligado"
+        j = self._janela_nova()
+        if item == "geral":
+            linhas = [f"Horário: {_janela_txt(None if j == '24/7' else j)}"]
+        else:
+            linhas = ["Ligado", "Horário: " + ("horário geral" if j is None else
+                                                "24/7" if j == "24/7" else _janela_txt(j))]
+        if "freq" in d:
+            linhas.append(f"Frequência: {_dur_txt(d['freq'])}")
+        if "ordens_fora" in d:
+            linhas.append("Execuções fora do horário: " +
+                          ("na hora" if d["ordens_fora"] else "guardadas"))
+        return "\n".join(linhas)
+
+    def _salvar(self):
+        item, d = self.wz["item"], self.wz["dados"]
+        if item == "moedas":
+            self.ag.st["simbolos_sugestao"] = list(d["moedas"])
+            return "✅ Moedas da sugestão salvas"
+        if "ordens_fora" in d:
+            self.ag.st["ordens_sempre"] = bool(d["ordens_fora"])
+        if item == "geral":
+            j = self._janela_nova()
+            self.ag.st["janela"] = None if j in (None, "24/7") else j
+            return "✅ Horário geral salvo"
+        it = self.ag.st["itens"][item]
+        if d.get("ativo") is False:
+            if ITENS[item][1]:
+                self.ag.st["freq"][item] = 0
+            it["ativo"] = False
+            return f"✅ {ITENS[item][0]}: desligado"
+        it["ativo"] = True
+        it["janela"] = self._janela_nova()
+        if ITENS[item][1]:
+            self.ag.st["freq"][item] = d.get("freq") or self.ag.freq(item) or 60
+            self.ag.st["ultimo"][item] = 0
+        return f"✅ {ITENS[item][0]} salvo"
+
+    # ---- clique em botão ------------------------------------------------------
+    def on_callback(self, cb_id, msg_id, dado):
+        w = self.wz
+        if not w or w.get("msg") != msg_id:
+            self.notif.responder_cb(cb_id, "Este menu expirou. Mande /config de novo.")
+            return
+        self.notif.responder_cb(cb_id)
+        acao, _, val = dado.partition(":")
+        d = w["dados"]
+        if acao == "fim":
+            w.clear()
+            self.notif.editar(msg_id, config_txt(self.cfg, self.ag, self.cache) +
+                              "\n\n👍 Configuração concluída. Para mudar de novo: /config")
+            return
+        if acao == "menu":
+            w.update({"item": None, "passo": None, "dados": {}})
+            self.notif.editar(msg_id, *self.tela_menu())
+            return
+        if acao == "item":
+            w.update({"item": val, "dados": {}})
+            if val == "moedas":
+                w["passo"] = "moedas"
+            elif val == "geral":
+                w["passo"] = "dias"
+                d["modo"] = "custom"
+            else:
+                w["passo"] = "ativo"
+        elif acao == "ativo":
+            d["ativo"] = val == "1"
+            d["modo"] = "custom"
+            self._avancar()
+        elif acao == "dia":
+            sel = d.setdefault("dias", list(range(7)))
+            i = int(val)
+            sel.remove(i) if i in sel else sel.append(i)
+        elif acao == "pre":
+            d["dias"] = {"todos": list(range(7)), "uteis": [0, 1, 2, 3, 4], "fds": [5, 6]}[val]
+        elif acao == "geral":
+            d["modo"] = "geral"
+            self._avancar()
+        elif acao == "sempre":
+            d["modo"] = "sempre"
+            self._avancar()
+        elif acao == "prox":
+            if w["passo"] == "dias" and not d.get("dias"):
+                self.notif.responder_cb(cb_id, "Marque pelo menos um dia.")
+                return
+            if w["passo"] == "moedas" and not d.get("moedas"):
+                self.notif.responder_cb(cb_id, "Marque pelo menos uma moeda.")
+                return
+            if w["passo"] == "dias":
+                d["modo"] = "custom"
+            self._avancar()
+        elif acao == "h":
+            chave = "inicio" if w["passo"] == "ini_h" else "fim"
+            d[chave] = int(val) * 60
+            self._avancar()
+            if int(val) == 24:                    # 24:00 não tem minutos
+                self._avancar()
+        elif acao == "m":
+            chave = "inicio" if w["passo"] == "ini_m" else "fim"
+            d[chave] = d[chave] // 60 * 60 + int(val)
+            if chave == "fim" and d["fim"] == d["inicio"]:
+                self.notif.responder_cb(cb_id, "O fim não pode ser igual ao início.")
+                w["passo"] = "fim_h"
+            else:
+                self._avancar()
+        elif acao == "f":
+            d["freq"] = int(val)
+            self._avancar()
+        elif acao == "of":
+            d["ordens_fora"] = val == "1"
+            self._avancar()
+        elif acao == "moeda":
+            q = self.cfg["moeda_cotacao"]
+            sel = [s if s.endswith(q) else s + q for s in d.setdefault("moedas", [])]
+            sel.remove(val) if val in sel else sel.append(val)
+            d["moedas"] = sel
+        elif acao == "recomecar":
+            w.update({"passo": "moedas" if w["item"] == "moedas" else
+                      "dias" if w["item"] == "geral" else "ativo",
+                      "dados": {"modo": "custom"} if w["item"] == "geral" else {}})
+        elif acao == "salvar":
+            aviso = self._salvar()
+            w.update({"item": None, "passo": None, "dados": {}})
+            self.notif.editar(msg_id, *self.tela_menu(aviso))
+            return
+        self.notif.editar(msg_id, *self.tela())
+
+
 class Notificador:
     def __init__(self, cfg, state):
         self.token = os.environ.get("TELEGRAM_TOKEN")
@@ -792,6 +1143,7 @@ class Notificador:
         self.enviados = state.setdefault("enviados", {})
         self.state = state
         self.agenda = None
+        self.config = None
         self.ler_comandos = cfg["comandos_telegram"] and bool(self.token and self.chat)
 
     # ---- comandos recebidos pelo próprio bot ------------------------------
@@ -799,6 +1151,37 @@ class Notificador:
         r = requests.post(f"https://api.telegram.org/bot{self.token}/{metodo}",
                           json=dados, timeout=15)
         return r.json()
+
+    def enviar_teclado(self, texto, teclado):
+        if not (self.token and self.chat):
+            log.info("MENU\n%s", texto)
+            return None
+        try:
+            d = self._api("sendMessage", chat_id=self.chat, text=texto[:4000],
+                          reply_markup={"inline_keyboard": teclado})
+            return d.get("result", {}).get("message_id")
+        except (requests.RequestException, ValueError) as e:
+            log.error("Falha ao enviar menu: %s", type(e).__name__)
+
+    def editar(self, msg_id, texto, teclado=None):
+        if not (self.token and self.chat and msg_id):
+            log.info("MENU\n%s", texto)
+            return
+        try:
+            d = self._api("editMessageText", chat_id=self.chat, message_id=msg_id,
+                          text=texto[:4000], reply_markup={"inline_keyboard": teclado or []})
+            if not d.get("ok") and "not modified" not in str(d.get("description")):
+                log.warning("Telegram recusou a edição: %s", d.get("description"))
+        except (requests.RequestException, ValueError) as e:
+            log.error("Falha ao editar menu: %s", type(e).__name__)
+
+    def responder_cb(self, cb_id, texto=""):
+        if not (self.token and cb_id):
+            return
+        try:
+            self._api("answerCallbackQuery", callback_query_id=cb_id, text=texto)
+        except (requests.RequestException, ValueError):
+            pass
 
     def registrar_menu(self):
         if not self.ler_comandos:
@@ -818,7 +1201,7 @@ class Notificador:
             return []
         try:
             d = self._api("getUpdates", offset=self.state.get("tg_offset", 0),
-                          timeout=0, allowed_updates=["message"])
+                          timeout=0, allowed_updates=["message", "callback_query"])
         except (requests.RequestException, ValueError) as e:
             log.warning("Falha ao ler comandos do Telegram: %s", type(e).__name__)
             return []
@@ -831,6 +1214,14 @@ class Notificador:
         textos = []
         for u in d.get("result", []):
             self.state["tg_offset"] = u["update_id"] + 1
+            cq = u.get("callback_query")
+            if cq:
+                msg = cq.get("message") or {}
+                if str(msg.get("chat", {}).get("id")) == str(self.chat) and \
+                        str(cq.get("data", "")).startswith("cfg|"):
+                    textos.append({"callback": {"id": cq["id"], "message_id": msg.get("message_id"),
+                                                "data": cq["data"]}})
+                continue
             m = u.get("message") or {}
             if str(m.get("chat", {}).get("id")) != str(self.chat):
                 continue                      # ignora qualquer outro chat
@@ -892,8 +1283,12 @@ class Notificador:
                 pz["suprimidos"] += 1
             log.info("PAUSADO (não enviado)\n%s", texto)
             return
-        if not forcar and self.agenda and not self.agenda.dentro() and not (
-                self.agenda.st["ordens_sempre"] and texto.startswith(ORDENS_URGENTES)):
+        cat = categoria_msg(texto)
+        if not forcar and self.agenda and cat and not self.agenda.ativo(cat):
+            log.info("CATEGORIA DESLIGADA (%s, não enviado)\n%s", cat, texto)
+            return
+        if not forcar and self.agenda and not self.agenda.dentro(cat) and not (
+                self.agenda.st["ordens_sempre"] and cat == "avisos_ordens"):
             fora = self.state.setdefault("fora", {"suprimidos": 0, "fila": []})
             if texto.startswith(CRITICOS):
                 fora["fila"] = (fora["fila"] + [time.strftime("%d/%m %H:%M ") + texto])[-20:]
@@ -961,6 +1356,7 @@ def ciclo(client, cfg, state, notif, cache):
     posicoes = cache.get("posicoes", {})
     simbolos = sorted((set(posicoes) | set(cfg["simbolos_extras"]) |
                        cache.get("simbolos_ordens", set())) & cache["validos"])
+    cache["simbolos"] = simbolos
 
     # Variação da carteira como um todo
     if posicoes:
@@ -1206,7 +1602,14 @@ def processar_comandos(pasta, client, cfg, notif, cache, ordens):
         arquivos = []
     for f in arquivos:
         try:
-            textos.append(f.read_text(encoding="utf-8").strip())
+            conteudo = f.read_text(encoding="utf-8").strip()
+            if conteudo.startswith("{"):
+                try:
+                    conteudo = json.loads(conteudo)
+                except ValueError:
+                    log.warning("Comando JSON inválido em %s", f.name)
+                    conteudo = ""
+            textos.append(conteudo)
             f.unlink()
         except OSError as e:
             log.warning("Não consegui ler o comando %s: %s", f.name, e)
@@ -1353,7 +1756,9 @@ Itens:
 O regime entra no /tendencia como um dos fatores. Você recebe um aviso quando o regime muda.""",
 "agenda": """📖 AGENDA E FREQUÊNCIA
 
-/agenda mostra o horário de atividade e a frequência de cada relatório.
+O jeito mais fácil é o /config: ele mostra tudo o que está sendo verificado e, se você quiser alterar, guia com botões: escolha o item (ex.: Regime) → ligado/desligado → dias da semana → hora de início → hora de fim → frequência → salvar. Cada categoria pode ter o próprio horário ou seguir o horário geral.
+
+Por texto, /agenda mostra o horário e a frequência de cada relatório.
 
 Horário de atividade (fora dele, nada é enviado; os avisos ficam guardados e chegam quando o horário abrir):
 • /agenda 24/7: sempre ativo
@@ -1382,6 +1787,7 @@ Alertas de padrão (🔔) e mudança de regime não têm frequência: chegam qua
 /retomar: volta a enviar e entrega os avisos de ordens guardados na pausa
 /tendencia: sugestão estatística de alta ou baixa e dos alvos (piso e teto) antes da ruptura. Use /tendencia ETH para outra moeda
 /regime: termômetro diário do mercado (on-chain, sentimento, notícias, juros e dólar)
+/config: mostra o que está sendo verificado e permite alterar tudo com botões, passo a passo
 /agenda: horário de atividade (ex.: /agenda uteis 08:00-18:00 ou /agenda 24/7)
 /frequencia: frequência de cada relatório (ex.: /frequencia regime 2h)
 /ajuda: esta explicação completa
@@ -1923,6 +2329,18 @@ def analisar_tendencia(client, cfg, simbolo, cache=None):
 
 
 def executar_comando(texto, client, cfg, notif, cache, ordens):
+    if isinstance(texto, dict):
+        cb = texto.get("callback") or {}
+        if notif.config and str(cb.get("data", "")).startswith("cfg|"):
+            log.info("Botão: %s", cb["data"])
+            try:
+                notif.config.on_callback(cb.get("id"), cb.get("message_id"), cb["data"][4:])
+            except Exception:
+                log.exception("Erro no assistente /config")
+                notif.responder_cb(cb.get("id"), "Erro no menu. Mande /config de novo.")
+        return
+    if not texto:
+        return
     partes = texto.lstrip("/").split(maxsplit=1)
     cmd = partes[0].lower().split("@")[0] if partes else ""
     arg = partes[1] if len(partes) > 1 else ""
@@ -1936,6 +2354,8 @@ def executar_comando(texto, client, cfg, notif, cache, ordens):
             notif.pausar(seg)
     elif cmd == "retomar":
         notif.retomar()
+    elif cmd in ("config", "configuracao", "configuração", "configuracoes", "configurações"):
+        notif.config.abrir()
     elif cmd == "agenda":
         notif.enviar(notif.agenda.cmd_agenda(arg), forcar=True)
     elif cmd in ("frequencia", "frequência", "freq"):
@@ -1960,7 +2380,7 @@ def executar_comando(texto, client, cfg, notif, cache, ordens):
         for t in ([tema] if tema in AJUDA else ORDEM_AJUDA):
             notif.enviar(AJUDA[t], forcar=True)
     else:
-        notif.enviar("Comandos do monitor: /status, /tendencia [moeda], /regime, /agenda, /frequencia, "
+        notif.enviar("Comandos do monitor: /status, /config, /tendencia [moeda], /regime, /agenda, /frequencia, "
                      "/pausar [30m|2h|1d], "
                      "/retomar, /ajuda",
                      forcar=True)
@@ -1992,6 +2412,7 @@ def main():
     state = load_state(state_path)
     notif = Notificador(cfg, state)
     notif.agenda = agenda = Agenda(cfg, state)
+    notif.config = Configurador(cfg, agenda, notif, cache)
     cache = {"validos": client.valid_symbols(cfg["moeda_cotacao"])}
     log.info("Monitor iniciado (%s)", ", ".join(cfg["intervalos"]))
 

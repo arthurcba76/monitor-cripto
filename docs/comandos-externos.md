@@ -23,7 +23,7 @@ repassá-los ao monitor por uma pasta:
    ```
    Se os serviços usam `ProtectSystem=strict`, acrescente a pasta ao
    `ReadWritePaths=` e coloque `SupplementaryGroups=monitorcmd` nos dois.
-3. No outro programa, ao receber `/status`, `/pausar [prazo]`, `/retomar`, `/tendencia [moeda]`, `/regime`, `/agenda [...]`, `/frequencia [...]` ou `/ajuda [tema]`
+3. No outro programa, ao receber `/status`, `/pausar [prazo]`, `/retomar`, `/tendencia [moeda]`, `/regime`, `/config`, `/agenda [...]`, `/frequencia [...]` ou `/ajuda [tema]`
    **do seu chat**, grave o texto exato do comando num arquivo novo, de forma
    atômica:
 
@@ -36,6 +36,19 @@ repassá-los ao monitor por uma pasta:
    os.chmod(tmp, 0o660)
    os.rename(tmp, tmp[:-4] + ".cmd")
    ```
+
+4. **Botões do `/config`**: o assistente usa botões (*inline keyboard*). Quando
+   o usuário toca num botão, o Telegram manda ao bot um `callback_query`. Se o
+   `callback_query.data` começar com `cfg|`, o outro programa deve repassá-lo
+   num arquivo `.cmd` com este JSON, na mesma linha:
+
+   ```json
+   {"callback": {"id": "<callback_query.id>", "message_id": <callback_query.message.message_id>, "data": "<callback_query.data>"}}
+   ```
+
+   Aceite só cliques vindos do seu chat. Não responda o `answerCallbackQuery`:
+   o monitor responde. Se o seu programa usa `allowed_updates`, inclua
+   `"callback_query"`.
 
 O monitor confere a pasta a cada ~3 segundos, apaga o arquivo e responde direto
 no Telegram. Se o arquivo ainda existir depois de 20 s, o serviço do monitor
