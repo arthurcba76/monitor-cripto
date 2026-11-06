@@ -29,5 +29,18 @@
   "intervalo_ordens_s": 15,
   "relatorio_ordens_min": 5,
   "comandos_telegram": true,
-  "pasta_comandos": ""
+  "pasta_comandos": "",
+  "regime": true,
+  "regime_horas": 6,
+  "regime_peso_tendencia": 0.2,
+  "noticias_min": 30,
+  "ollama_url": "http://127.0.0.1:11434",
+  "ollama_modelo": "qwen2.5:3b",
+  "feeds_rss": [
+    "https://www.coindesk.com/arc/outboundfeeds/rss/",
+    "https://cointelegraph.com/rss",
+    "https://decrypt.co/feed",
+    "https://bitcoinmagazine.com/.rss/full/",
+    "https://www.theblock.co/rss.xml"
+  ]
 }

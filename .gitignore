@@ -5,6 +5,8 @@
 config.json
 estado.json
 estado.tmp
+regime.json
+regime.tmp
 monitor.log*
 comandos/
 

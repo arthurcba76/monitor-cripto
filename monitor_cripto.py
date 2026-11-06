@@ -23,7 +23,9 @@ import logging
 import math
 import os
 import random
+import re
 import sys
+import threading
 import time
 from logging.handlers import RotatingFileHandler
 from dataclasses import dataclass, field
@@ -70,6 +72,19 @@ DEFAULT_CONFIG = {
                                       # (use false se o bot já é lido por outro programa)
     "pasta_comandos": "",             # alternativa: outro programa grava *.cmd aqui;
                                       # vazio = ./comandos
+    "regime": True,                   # camada diária: on-chain, sentimento, notícias, macro
+    "regime_horas": 6,                # recálculo do regime (os dados mudam 1x/dia)
+    "regime_peso_tendencia": 0.20,    # peso do regime dentro do /tendencia
+    "noticias_min": 30,               # leitura dos feeds RSS + classificação
+    "ollama_url": "http://127.0.0.1:11434",
+    "ollama_modelo": "qwen2.5:3b",
+    "feeds_rss": [
+        "https://www.coindesk.com/arc/outboundfeeds/rss/",
+        "https://cointelegraph.com/rss",
+        "https://decrypt.co/feed",
+        "https://bitcoinmagazine.com/.rss/full/",
+        "https://www.theblock.co/rss.xml",
+    ],
 }
 
 COMANDOS_MENU = [
@@ -77,6 +92,7 @@ COMANDOS_MENU = [
     {"command": "pausar", "description": "Pausa os alertas (ex.: /pausar 2h)"},
     {"command": "retomar", "description": "Retoma os alertas"},
     {"command": "tendencia", "description": "Sugestão de direção e alvos (ex.: /tendencia ETH)"},
+    {"command": "regime", "description": "Termômetro diário: on-chain, sentimento, macro"},
     {"command": "ajuda", "description": "O que significa cada informação"},
 ]
 
@@ -1082,6 +1098,9 @@ Faixa provável em 24h: onde o preço deve estar daqui a um dia em ~68% dos caso
 
 Fatores:
 • Tendência: direção das médias em cada tempo gráfico
+• EMAs 9/21/55/200: médias alinhadas para cima = tendência saudável; preço muito longe da EMA 200 = esticado
+• Bollinger: bandas apertadas avisam que um movimento forte pode vir; preço fora da banda = esticado
+• Regime diário: o termômetro do /regime
 • RSI: força; extremos contam contra (risco de correção ou repique)
 • Fluxo agressor: % do volume em compras "a mercado" (quem tem pressa de comprar)
 • Livro de ofertas: quanto há de ordens de compra x venda perto do preço
@@ -1090,6 +1109,27 @@ Fatores:
 • Long/short: proporção de contas compradas x vendidas (extremos = sinal contrário)
 
 ⚠️ É uma estimativa, não previsão. Os pesos não foram testados no histórico.""",
+"regime": """📖 COMO LER O /regime
+
+É o "termômetro" do mercado, calculado uma vez a cada poucas horas com dados diários. Diz se o ambiente está a favor ou contra, independente do gráfico de curto prazo.
+
+Regimes: EUFORIA (preço muito acima do custo médio, ganância), OTIMISMO, NEUTRO, MEDO, CAPITULAÇÃO (pânico ou preço abaixo do custo médio dos investidores).
+
+Viés macro: de −1 (ambiente desfavorável) a +1 (favorável).
+
+Itens:
+• MVRV Z-Score: quanto o preço está acima do preço médio pago por todos os bitcoins. Muito alto (>6) costuma marcar topos; abaixo de 0, fundos
+• Fluxo de corretoras: BTC entrando nas corretoras costuma ser para vender; saindo, para guardar (acumulação)
+• Saldo nas corretoras: menos BTC disponível para venda tende a ajudar o preço
+• Endereços ativos: rede sendo mais ou menos usada
+• Fear & Greed: medo/ganância do varejo. Leitura contrária: medo extremo costuma ser oportunidade; ganância extrema, risco
+• Juros do Fed: cortes aumentam a liquidez (bom para ativos de risco)
+• Dólar: o bitcoin costuma andar ao contrário do dólar
+• Notícias: manchetes das últimas 24h classificadas por um modelo de IA local como alta, baixa ou neutra
+
+🚨 Extremos convergentes: no /tendencia, quando euforia + funding alto + RSI sobrecomprado aparecem juntos (ou o inverso), o risco de reversão brusca é maior.
+
+O regime entra no /tendencia como um dos fatores. Você recebe um aviso quando o regime muda.""",
 "comandos": """📖 COMANDOS
 
 /status: análise atual de cada moeda e suas ordens/posições abertas
@@ -1097,17 +1137,310 @@ Fatores:
 /pausar 30m, /pausar 2h, /pausar 1d: pausa por um tempo e volta sozinho
 /retomar: volta a enviar e entrega os avisos de ordens guardados na pausa
 /tendencia: sugestão estatística de alta ou baixa e dos alvos (piso e teto) antes da ruptura. Use /tendencia ETH para outra moeda
+/regime: termômetro diário do mercado (on-chain, sentimento, notícias, juros e dólar)
 /ajuda: esta explicação completa
-/ajuda alertas, /ajuda termos, /ajuda ordens, /ajuda tendencia, /ajuda comandos: só uma parte
+/ajuda alertas, termos, ordens, tendencia, regime ou comandos: só uma parte
 
 Durante a pausa o monitor continua acompanhando tudo. Avisos de execução de ordens nunca se perdem: ficam guardados e chegam quando você retomar.
 
 ⚠️ O monitor identifica padrões, não prevê o futuro e não é recomendação de compra ou venda.""",
 }
-ORDEM_AJUDA = ["alertas", "termos", "ordens", "tendencia", "comandos"]
+ORDEM_AJUDA = ["alertas", "termos", "ordens", "tendencia", "regime", "comandos"]
 SINONIMOS_AJUDA = {"alerta": "alertas", "termo": "termos", "glossario": "termos",
                    "glossário": "termos", "ordem": "ordens", "posicoes": "ordens",
                    "posições": "ordens", "comando": "comandos", "tendência": "tendencia"}
+
+
+# --------------------------------------------------------------------------
+# Camada de REGIME (dados diários): on-chain, sentimento, notícias e macro.
+# Roda numa thread própria para nunca atrasar o acompanhamento de ordens.
+# --------------------------------------------------------------------------
+CM_URL = "https://community-api.coinmetrics.io/v4/timeseries/asset-metrics"
+CM_METRICAS = ["CapMrktCurUSD", "CapMVRVCur", "FlowInExNtv", "FlowOutExNtv",
+               "SplyExNtv", "AdrActCnt"]
+FRED_CSV = "https://fred.stlouisfed.org/graph/fredgraph.csv?id="
+UA_DADOS = {"User-Agent": "monitor-cripto/1.0"}
+
+
+def _http(url, timeout=30, **kw):
+    r = requests.get(url, headers=UA_DADOS, timeout=timeout, **kw)
+    r.raise_for_status()
+    return r
+
+
+def baixar_coinmetrics():
+    """Histórico diário do BTC (Coin Metrics Community, CC BY-NC 4.0)."""
+    linhas, url = [], CM_URL
+    params = {"assets": "btc", "metrics": ",".join(CM_METRICAS), "frequency": "1d",
+              "page_size": 10000, "start_time": "2010-07-18"}
+    for _ in range(5):
+        d = _http(url, params=params, timeout=60).json()
+        linhas += d.get("data", [])
+        url, params = d.get("next_page_url"), None
+        if not url:
+            break
+    linhas.sort(key=lambda x: x["time"])
+    return linhas
+
+
+def serie(linhas, campo):
+    return [float(x[campo]) for x in linhas if x.get(campo) not in (None, "")]
+
+
+def baixar_fred(id_serie):
+    out = []
+    for linha in _http(FRED_CSV + id_serie).text.strip().splitlines()[1:]:
+        data, _, valor = linha.partition(",")
+        if valor not in (".", ""):
+            out.append((data, float(valor)))
+    return out
+
+
+def desvio(xs):
+    m = mean(xs)
+    return (sum((x - m) ** 2 for x in xs) / len(xs)) ** 0.5 if xs else 0
+
+
+def classificar_manchetes(cfg, titulos):
+    """Classifica manchetes com o modelo local do Ollama: +1 alta, -1 baixa, 0 neutro."""
+    prompt = ("You are a crypto market analyst. For each headline, say if its likely "
+              "short-term impact on the Bitcoin price is ALTA (up), BAIXA (down) or "
+              "NEUTRO (neutral/unrelated). Return JSON {\"r\": [..]} with one word per "
+              "headline, in the same order.\n\n" +
+              "\n".join(f"{i + 1}. {t}" for i, t in enumerate(titulos)))
+    r = requests.post(cfg["ollama_url"].rstrip("/") + "/api/generate", timeout=180, json={
+        "model": cfg["ollama_modelo"], "prompt": prompt, "stream": False,
+        "format": "json", "options": {"temperature": 0}})
+    r.raise_for_status()
+    resp = json.loads(r.json()["response"]).get("r", [])
+    if len(resp) != len(titulos):
+        raise ValueError(f"modelo devolveu {len(resp)} classes para {len(titulos)} manchetes")
+    mapa = {"ALTA": 1, "BAIXA": -1, "NEUTRO": 0}
+    return [mapa.get(str(x).strip().upper(), 0) for x in resp]
+
+
+def ler_feeds(cfg):
+    import xml.etree.ElementTree as ET
+    from email.utils import parsedate_to_datetime
+    itens = []
+    for url in cfg["feeds_rss"]:
+        try:
+            raiz = ET.fromstring(_http(url, timeout=20).content)
+        except Exception as e:
+            log.info("Feed indisponível %s: %s", url, type(e).__name__)
+            continue
+        fonte = url.split("/")[2].replace("www.", "")
+        for it in raiz.iter("item"):
+            titulo = (it.findtext("title") or "").strip()
+            try:
+                t = parsedate_to_datetime(it.findtext("pubDate")).timestamp()
+            except Exception:
+                t = time.time()
+            if titulo:
+                itens.append({"titulo": titulo, "fonte": fonte, "t": t})
+    return itens
+
+
+class Regime:
+    """Calcula e guarda o regime em regime.json (separado do estado principal)."""
+
+    def __init__(self, cfg, cache):
+        self.cfg, self.cache = cfg, cache
+        self.arq = APP_DIR / "regime.json"
+        try:
+            self.dados = json.loads(self.arq.read_text())
+        except (OSError, ValueError):
+            self.dados = {}
+        self.dados.setdefault("noticias", [])
+        cache["regime"] = self.dados.get("resultado")
+
+    def salvar(self):
+        tmp = self.arq.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.dados, ensure_ascii=False))
+        tmp.replace(self.arq)
+
+    # ---- notícias -------------------------------------------------------
+    def atualizar_noticias(self):
+        agora = time.time()
+        conhecidas = {n["titulo"] for n in self.dados["noticias"]}
+        novas = [i for i in ler_feeds(self.cfg)
+                 if i["titulo"] not in conhecidas and agora - i["t"] < 48 * 3600]
+        novas = list({n["titulo"]: n for n in novas}.values())[:40]
+        for k in range(0, len(novas), 10):
+            lote = novas[k:k + 10]
+            try:
+                classes = classificar_manchetes(self.cfg, [n["titulo"] for n in lote])
+            except Exception as e:
+                log.warning("Classificação de notícias indisponível: %s", str(e)[:120])
+                return
+            for n, c in zip(lote, classes):
+                n["classe"] = c
+            self.dados["noticias"] += lote
+        self.dados["noticias"] = [n for n in self.dados["noticias"]
+                                  if agora - n["t"] < 48 * 3600 and "classe" in n]
+        self.salvar()
+
+    # ---- regime ---------------------------------------------------------
+    def calcular(self):
+        comp, avisos = [], []
+
+        def add(nome, valor, peso, texto):
+            # decimais com vírgula; \x00 marca o separador de milhar (ponto)
+            texto = re.sub(r"(?<=\d)\.(?=\d)", ",", texto).replace("\x00", ".")
+            comp.append({"nome": nome, "v": _clip(valor), "peso": peso, "texto": texto})
+
+        # On-chain (Coin Metrics)
+        try:
+            cm = baixar_coinmetrics()
+            ult = cm[-1]
+            mc = serie(cm, "CapMrktCurUSD")
+            pares = [(float(x["CapMrktCurUSD"]), float(x["CapMVRVCur"])) for x in cm
+                     if x.get("CapMrktCurUSD") and x.get("CapMVRVCur")]
+            mc_u, mvrv_u = pares[-1]
+            rc = mc_u / mvrv_u                     # realized cap = market cap / MVRV
+            z = (mc_u - rc) / (desvio([p[0] for p in pares]) or 1)
+            add("mvrv", (2 - z) / 3, 0.20,
+                f"MVRV Z-Score {z:.2f} (MVRV {mvrv_u:.2f}): " +
+                ("zona de euforia/topo histórico" if z > 6 else "caro" if z > 3 else
+                 "barato, abaixo do custo médio" if z < 0 else "neutro"))
+            liq = [float(x["FlowInExNtv"]) - float(x["FlowOutExNtv"]) for x in cm
+                   if x.get("FlowInExNtv") and x.get("FlowOutExNtv")]
+            if len(liq) > 400:
+                s7 = [sum(liq[i - 7:i]) for i in range(len(liq) - 365, len(liq) + 1)]
+                zf = (s7[-1] - mean(s7)) / (desvio(s7) or 1)
+                qtd = f"{s7[-1]:+,.0f}".replace(",", "\x00")
+                add("fluxo", -zf / 2, 0.15,
+                    f"Fluxo de corretoras 7d: {qtd} BTC "
+                    f"({'entrada: pressão de venda' if s7[-1] > 0 else 'saída: acumulação'}; "
+                    f"z {zf:+.1f})")
+            sx = serie(cm, "SplyExNtv")
+            if len(sx) > 31:
+                ch = sx[-1] / sx[-31] - 1
+                add("saldo", -ch / 0.02, 0.10,
+                    f"Saldo de BTC nas corretoras 30d: {ch * 100:+.1f}% "
+                    f"({'caindo: menos oferta à venda' if ch < 0 else 'subindo: mais oferta'})")
+            ad = serie(cm, "AdrActCnt")
+            if len(ad) > 365:
+                ratio = mean(ad[-30:]) / mean(ad[-365:])
+                add("enderecos", (ratio - 1) / 0.15, 0.10,
+                    f"Endereços ativos (média 30d vs 1 ano): {(ratio - 1) * 100:+.1f}%")
+            onchain_data = ult["time"][:10]
+        except Exception as e:
+            avisos.append(f"on-chain indisponível ({type(e).__name__})")
+            z, onchain_data = None, None
+
+        # Fear & Greed (Alternative.me)
+        fg = None
+        try:
+            d = _http("https://api.alternative.me/fng/?limit=1").json()["data"][0]
+            fg = int(d["value"])
+            add("fg", (50 - fg) / 35, 0.15,
+                f"Fear & Greed {fg} ({d['value_classification']}): leitura contrária")
+        except Exception as e:
+            avisos.append(f"Fear & Greed indisponível ({type(e).__name__})")
+
+        # Macro (FRED)
+        try:
+            teto = baixar_fred("DFEDTARU")
+            ant = [v for dt, v in teto if dt <= time.strftime(
+                "%Y-%m-%d", time.gmtime(time.time() - 90 * 86400))]
+            mud = teto[-1][1] - (ant[-1] if ant else teto[-1][1])
+            add("fed", -mud / 0.5, 0.05,
+                f"Juros do Fed: teto {teto[-1][1]:.2f}%, {mud:+.2f} p.p. em 90d" +
+                (" (cortes: mais liquidez)" if mud < 0 else " (altas: menos liquidez)" if mud > 0 else ""))
+        except Exception as e:
+            avisos.append(f"juros do Fed indisponível ({type(e).__name__})")
+        try:
+            usd = baixar_fred("DTWEXBGS")
+            ch = usd[-1][1] / usd[-22][1] - 1
+            add("dolar", -ch / 0.02, 0.10,
+                f"Dólar amplo (≈DXY) ~30d: {ch * 100:+.1f}% "
+                f"({'dólar forte pesa contra' if ch > 0 else 'dólar fraco ajuda'})")
+        except Exception as e:
+            avisos.append(f"dólar indisponível ({type(e).__name__})")
+
+        # Notícias (classificadas pelo modelo local)
+        ns = [n for n in self.dados["noticias"] if time.time() - n["t"] < 24 * 3600]
+        if len(ns) >= 5:
+            alta = sum(n["classe"] > 0 for n in ns) / len(ns)
+            baixa = sum(n["classe"] < 0 for n in ns) / len(ns)
+            add("noticias", (alta - baixa) * 2, 0.15,
+                f"Notícias 24h: {len(ns)} manchetes, {alta * 100:.0f}% alta / "
+                f"{baixa * 100:.0f}% baixa")
+        else:
+            avisos.append("notícias: poucas manchetes classificadas nas últimas 24h")
+
+        peso = sum(c["peso"] for c in comp)
+        score = sum(c["v"] * c["peso"] for c in comp) / peso if peso else 0
+        if (z is not None and z > 6) or (fg is not None and fg >= 80 and (z or 0) > 3):
+            nome = "EUFORIA"
+        elif (z is not None and z < 0) or (fg is not None and fg <= 15):
+            nome = "CAPITULAÇÃO"
+        elif fg is not None and fg < 40:
+            nome = "MEDO"
+        elif fg is not None and fg > 60:
+            nome = "OTIMISMO"
+        else:
+            nome = "NEUTRO"
+        res = {"nome": nome, "score": score, "componentes": comp, "avisos": avisos,
+               "z": z, "fg": fg, "onchain_data": onchain_data, "t": time.time()}
+        anterior = (self.dados.get("resultado") or {}).get("nome")
+        if anterior and anterior != nome:
+            self.cache["regime_mudou"] = (anterior, nome)
+        self.dados["resultado"] = res
+        self.cache["regime"] = res
+        self.salvar()
+        return res
+
+    def rodar(self):
+        """Laço da thread: notícias a cada N min, regime a cada N horas."""
+        ult_not = ult_reg = 0
+        while True:
+            agora = time.time()
+            try:
+                if agora - ult_not >= self.cfg["noticias_min"] * 60:
+                    ult_not = agora
+                    self.atualizar_noticias()
+                if agora - ult_reg >= self.cfg["regime_horas"] * 3600 or \
+                        self.cache.pop("regime_forcar", False):
+                    ult_reg = agora
+                    self.calcular()
+            except Exception:
+                log.exception("Erro na camada de regime")
+            time.sleep(10)
+
+
+def regime_txt(r):
+    if not r:
+        return "🌡️ Regime ainda não calculado (o primeiro cálculo leva 1–2 minutos após iniciar)."
+    forca = "neutro" if abs(r["score"]) < 0.15 else ("favorável" if r["score"] > 0 else "desfavorável")
+    linhas = [f"🌡️ Regime de mercado: {r['nome']} | viés macro {r['score']:+.2f} ({forca})"
+              .replace(".", ",", 1)]
+    for c in r["componentes"]:
+        s = "+" if c["v"] > 0.1 else "−" if c["v"] < -0.1 else "="
+        linhas.append(f"{s} {c['texto']}")
+    if r["avisos"]:
+        linhas.append("ℹ️ " + "; ".join(r["avisos"]))
+    linhas += ["", "Atualizado: " + time.strftime("%d/%m %H:%M", time.localtime(r["t"])) +
+               (f" | on-chain de {r['onchain_data']}" if r.get("onchain_data") else ""),
+               "Fontes: Coin Metrics Community (CC BY-NC 4.0), Fear & Greed Index por "
+               "Alternative.me, FRED/St. Louis Fed, feeds RSS de notícias "
+               "(classificação por modelo local)."]
+    return "\n".join(linhas)
+
+
+def extremos_convergentes(regime, funding_pct, rsi_v):
+    """Euforia + funding alto + RSI sobrecomprado (ou o inverso): risco de reversão."""
+    if not regime or funding_pct is None:
+        return None
+    fg = regime.get("fg") or 50
+    if (regime["nome"] == "EUFORIA" or fg >= 75) and funding_pct > 0.03 and rsi_v > 70:
+        return ("🚨 Extremos convergentes de ALTA (euforia + funding alto + RSI sobrecomprado): "
+                "risco elevado de reversão para baixo / liquidação de comprados.")
+    if (regime["nome"] == "CAPITULAÇÃO" or fg <= 25) and funding_pct < 0 and rsi_v < 30:
+        return ("🚨 Extremos convergentes de BAIXA (medo extremo + funding negativo + RSI "
+                "sobrevendido): risco elevado de reversão para cima / short squeeze.")
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -1132,7 +1465,7 @@ def zonas_de(cs, cfg):
     return build_zones(topos, fundos, A, cfg), A
 
 
-def analisar_tendencia(client, cfg, simbolo):
+def analisar_tendencia(client, cfg, simbolo, cache=None):
     """Retorna o texto da resposta do /tendencia para um par."""
     quote = cfg["moeda_cotacao"]
     sym = simbolo.upper()
@@ -1145,7 +1478,7 @@ def analisar_tendencia(client, cfg, simbolo):
         score += _clip(valor) * peso
         peso_total += peso
         sinal = "+" if valor > 0.1 else "−" if valor < -0.1 else "="
-        fatores.append(f"{sinal} {texto}")
+        fatores.append(f"{sinal} " + re.sub(r"(?<=\d)\.(?=\d)", ",", texto))
 
     # 1) Velas e análise técnica de cada intervalo
     velas, resumo = {}, {}
@@ -1165,7 +1498,7 @@ def analisar_tendencia(client, cfg, simbolo):
     cs = velas[base_itv]
     preco = float(client.get("/api/v3/ticker/price", {"symbol": sym})["price"])
 
-    peso_itv = 0.35 / len(resumo)
+    peso_itv = 0.30 / len(resumo)
     for itv, r in resumo.items():
         v = {"alta": 1, "baixa": -1}.get(r["tendencia"], 0)
         soma(v, peso_itv, f"Tendência [{itv}]: {r['tendencia']}")
@@ -1178,11 +1511,36 @@ def analisar_tendencia(client, cfg, simbolo):
     else:
         soma((rsi_v - 50) / 20, 0.10, f"RSI [{base_itv}] {rsi_v}")
 
+    # EMAs 9/21/55/200: alinhamento das médias (tendência micro → macro)
+    C = [c.c for c in cs]
+    emas = {n: ema(C, n)[-1] for n in (9, 21, 55, 200)}
+    ordem = [emas[9], emas[21], emas[55], emas[200]]
+    alinh = sum(1 if ordem[i] > ordem[i + 1] else -1 for i in range(3)) / 3
+    dist200 = (preco / emas[200] - 1) * 100
+    soma(alinh, 0.10, f"EMAs 9/21/55/200 [{base_itv}]: " +
+         ("alinhadas para cima" if alinh == 1 else "alinhadas para baixo" if alinh == -1
+          else "misturadas") + f"; preço {dist200:+.1f}% da EMA 200".replace(".", ","))
+
+    # Bandas de Bollinger 20/2: posição e compressão (squeeze)
+    jan = C[-20:]
+    mb, dp = mean(jan), desvio(jan)
+    if dp > 0:
+        pct_b = (preco - (mb - 2 * dp)) / (4 * dp)
+        larg = [desvio(C[i - 20:i]) / mean(C[i - 20:i]) for i in range(len(C) - 120, len(C) + 1)]
+        aperto = sorted(larg).index(larg[-1]) / len(larg)
+        txt = f"Bollinger [{base_itv}]: %B {pct_b * 100:.0f}%"
+        if aperto < 0.15:
+            txt += ", bandas apertadas (squeeze): movimento forte costuma vir a seguir"
+        v = -0.4 if pct_b > 1 else 0.4 if pct_b < 0 else 0
+        if v:
+            txt += ", fora da banda (esticado: tendência a voltar)"
+        soma(v, 0.05, txt)
+
     # 2) Fluxo: compras agressivas x vendas agressivas nas últimas 24 velas
     vol = sum(c.v for c in cs[-24:])
     if vol > 0 and any(c.tb for c in cs[-24:]):
         compra = sum(c.tb for c in cs[-24:]) / vol
-        soma((compra - 0.5) * 10, 0.15,
+        soma((compra - 0.5) * 10, 0.12,
              f"Fluxo agressor [{base_itv}, 24 velas]: {compra * 100:.0f}% compras")
 
     # 3) Livro de ofertas: volume de compra x venda até ±1% do preço
@@ -1192,7 +1550,7 @@ def analisar_tendencia(client, cfg, simbolo):
         ask = sum(float(q) for p, q in livro["asks"] if float(p) <= preco * 1.01)
         if bid + ask > 0:
             imb = (bid - ask) / (bid + ask)
-            soma(imb * 2, 0.15, f"Livro de ofertas (±1%): {bid / (bid + ask) * 100:.0f}% do lado da compra")
+            soma(imb * 2, 0.10, f"Livro de ofertas (±1%): {bid / (bid + ask) * 100:.0f}% do lado da compra")
 
     # 4) Mercado futuro (público): open interest, funding, long/short
     oi = _publico(client, "/futures/data/openInterestHist",
@@ -1203,30 +1561,39 @@ def analisar_tendencia(client, cfg, simbolo):
         d_px = cs[-1].c / cs[-5].c - 1
         lado = 1 if d_px > 0 else -1
         if d_oi > 0.005:
-            soma(lado * 0.8, 0.10, f"Open interest {d_oi * 100:+.1f}% em 4h com preço "
+            soma(lado * 0.8, 0.08, f"Open interest {d_oi * 100:+.1f}% em 4h com preço "
                  f"{'subindo' if lado > 0 else 'caindo'}: dinheiro novo a favor do movimento")
         elif d_oi < -0.005:
-            soma(lado * 0.3, 0.10, f"Open interest {d_oi * 100:+.1f}% em 4h: posições fechando, "
+            soma(lado * 0.3, 0.08, f"Open interest {d_oi * 100:+.1f}% em 4h: posições fechando, "
                  "movimento perde combustível")
         else:
-            soma(0, 0.10, "Open interest estável em 4h")
+            soma(0, 0.08, "Open interest estável em 4h")
     prem = _publico(client, "/fapi/v1/premiumIndex", {"symbol": sym}, base=FAPI_URL)
+    funding_pct = None
     if prem and "lastFundingRate" in prem:
-        f = float(prem["lastFundingRate"]) * 100
+        f = funding_pct = float(prem["lastFundingRate"]) * 100
         if f > 0.03:
-            soma(-0.6, 0.05, f"Funding {f:.3f}%: muitos comprados alavancados (risco de queda)")
+            soma(-0.6, 0.04, f"Funding {f:.3f}%: muitos comprados alavancados (risco de queda)")
         elif f < -0.01:
-            soma(0.6, 0.05, f"Funding {f:.3f}%: muitos vendidos alavancados (risco de alta)")
+            soma(0.6, 0.04, f"Funding {f:.3f}%: muitos vendidos alavancados (risco de alta)")
         else:
-            soma(0, 0.05, f"Funding {f:.3f}%: neutro")
+            soma(0, 0.04, f"Funding {f:.3f}%: neutro")
     ls = _publico(client, "/futures/data/globalLongShortAccountRatio",
                   {"symbol": sym, "period": "1h", "limit": 1}, base=FAPI_URL)
     if ls:
         r_ls = float(ls[-1]["longShortRatio"])
         v = -0.5 if r_ls > 2 else 0.5 if r_ls < 0.8 else 0
-        soma(v, 0.05, f"Contas long/short: {r_ls:.2f}" +
+        soma(v, 0.04, f"Contas long/short: {r_ls:.2f}" +
              (" (multidão muito comprada: sinal contrário)" if r_ls > 2 else
               " (multidão muito vendida: sinal contrário)" if r_ls < 0.8 else ""))
+
+    # Camada de regime (diária)
+    regime = (cache or {}).get("regime")
+    if regime and time.time() - regime["t"] < 2 * 86400:
+        soma(regime["score"] * 1.5, cfg["regime_peso_tendencia"],
+             f"Regime diário: {regime['nome']} (viés macro {regime['score']:+.2f}; /regime)"
+             .replace(".", ",", 1))
+    alerta_ext = extremos_convergentes(regime, funding_pct, rsi_v)
 
     score = score / peso_total if peso_total else 0
 
@@ -1296,7 +1663,7 @@ def analisar_tendencia(client, cfg, simbolo):
         f"Faixa provável em 24h (68%): {fmt(preco * math.exp(-s24))} – {fmt(preco * math.exp(s24))}",
         "",
         "Fatores considerados:",
-    ] + fatores + [
+    ] + fatores + ([ "", alerta_ext] if alerta_ext else []) + [
         "",
         "⚠️ Estimativa estatística com os dados deste momento, não previsão nem "
         "recomendação. Os pesos dos fatores são fixos e não foram testados no "
@@ -1319,10 +1686,12 @@ def executar_comando(texto, client, cfg, notif, cache, ordens):
             notif.pausar(seg)
     elif cmd == "retomar":
         notif.retomar()
+    elif cmd == "regime":
+        notif.enviar(regime_txt(cache.get("regime")), forcar=True)
     elif cmd in ("tendencia", "tendência"):
         alvo = arg.split()[0] if arg.strip() else (cfg["simbolos_extras"] or ["BTC"])[0]
         try:
-            notif.enviar(analisar_tendencia(client, cfg, alvo), forcar=True)
+            notif.enviar(analisar_tendencia(client, cfg, alvo, cache), forcar=True)
         except Exception as e:
             log.exception("Erro no /tendencia")
             notif.enviar(f"⚠️ Erro ao calcular a tendência: {type(e).__name__}", forcar=True)
@@ -1337,7 +1706,7 @@ def executar_comando(texto, client, cfg, notif, cache, ordens):
         for t in ([tema] if tema in AJUDA else ORDEM_AJUDA):
             notif.enviar(AJUDA[t], forcar=True)
     else:
-        notif.enviar("Comandos do monitor: /status, /tendencia [moeda], /pausar [30m|2h|1d], "
+        notif.enviar("Comandos do monitor: /status, /tendencia [moeda], /regime, /pausar [30m|2h|1d], "
                      "/retomar, /ajuda",
                      forcar=True)
 
@@ -1380,10 +1749,19 @@ def main():
     log.info("Lendo comandos em %s%s", pasta,
              " e no Telegram" if notif.ler_comandos else "")
     notif.registrar_menu()
+    if cfg["regime"] and not args.once:
+        reg = Regime(cfg, cache)
+        threading.Thread(target=reg.rodar, name="regime", daemon=True).start()
+        log.info("Camada de regime ativa (notícias a cada %s min, regime a cada %s h)",
+                 cfg["noticias_min"], cfg["regime_horas"])
     ultimo_ciclo = ultima_ordem = 0
     while True:
         inicio = time.time()
         rodou = processar_comandos(pasta, client, cfg, notif, cache, ordens)
+        mudou = cache.pop("regime_mudou", None)
+        if mudou:
+            notif.enviar(f"🌡️ Mudança de regime: {mudou[0]} → {mudou[1]}\n\n" +
+                         regime_txt(cache.get("regime")))
         if ordens and inicio - ultima_ordem >= cfg["intervalo_ordens_s"]:
             ultima_ordem = rodou = inicio
             try:

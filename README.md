@@ -51,7 +51,8 @@ notebook, um Raspberry Pi ou uma máquina virtual) como serviço do `systemd`. �
 | `/pausar` | Pausa os alertas até você mandar `/retomar`. Aceita prazo: `/pausar 30m`, `/pausar 2h`, `/pausar 1d`. |
 | `/retomar` | Volta a enviar os alertas e entrega os avisos de ordens que ficaram guardados durante a pausa. |
 | `/tendencia` | Sugestão estatística de **alta, baixa ou lateral**, com o teto e o piso que o preço tende a alcançar antes de romper, a chance estimada de tocar cada lado primeiro, o tempo típico, a faixa provável em 24h e os fatores usados. Outra moeda: `/tendencia ETH`. |
-| `/ajuda` | Explica em linguagem simples cada alerta, cada termo dos relatórios (suporte, RSI, ATR, pavio…), os avisos de ordens e os comandos. Para ver só uma parte: `/ajuda alertas`, `/ajuda termos`, `/ajuda ordens`, `/ajuda tendencia` ou `/ajuda comandos`. |
+| `/regime` | Termômetro diário do mercado: **EUFORIA, OTIMISMO, NEUTRO, MEDO ou CAPITULAÇÃO**, com MVRV Z-Score, fluxo e saldo de BTC nas corretoras, endereços ativos, Fear & Greed, juros do Fed, dólar e sentimento das notícias. Você também recebe um aviso quando o regime muda. |
+| `/ajuda` | Explica em linguagem simples cada alerta, cada termo dos relatórios (suporte, RSI, ATR, pavio…), os avisos de ordens e os comandos. Para ver só uma parte: `/ajuda alertas`, `/ajuda termos`, `/ajuda ordens`, `/ajuda tendencia`, `/ajuda regime` ou `/ajuda comandos`. |
 
 O monitor só aceita comandos vindos do `TELEGRAM_CHAT_ID` configurado e ignora
 qualquer outro chat. Durante a pausa ele continua acompanhando tudo: os alertas
@@ -136,6 +137,41 @@ mudar.
 | `relatorio_ordens_min` | `5` | Intervalo do relatório 📋 enquanto houver algo aberto. |
 | `comandos_telegram` | `true` | O próprio monitor lê os comandos enviados ao bot. |
 | `pasta_comandos` | `""` | Pasta onde outro programa pode gravar comandos (`*.cmd`). |
+| `regime` | `true` | Liga a camada diária (on-chain, sentimento, notícias, macro). |
+| `regime_horas` | `6` | Intervalo de recálculo do regime. |
+| `regime_peso_tendencia` | `0.20` | Peso do regime dentro do `/tendencia`. |
+| `noticias_min` | `30` | Intervalo de leitura e classificação das notícias. |
+| `ollama_url` / `ollama_modelo` | `http://127.0.0.1:11434` / `qwen2.5:3b` | Modelo local que classifica as manchetes. |
+| `feeds_rss` | 5 portais | Feeds de notícias lidos. |
+
+### Camada de regime (dados diários, todos gratuitos)
+
+Roda numa linha de execução separada (*thread*), então nunca atrasa o
+acompanhamento das ordens. Ela recalcula a cada `regime_horas` e lê as notícias a
+cada `noticias_min`.
+
+| Item | Fonte (gratuita) | Peso | Leitura |
+|---|---|---|---|
+| MVRV Z-Score | Coin Metrics Community (`CapMrktCurUSD`, `CapMVRVCur`) | 20% | O *realized cap* sai de market cap ÷ MVRV. Z alto = caro (topo); Z < 0 = barato (fundo). |
+| Fluxo líquido de corretoras 7d | Coin Metrics (`FlowInExNtv` − `FlowOutExNtv`) | 15% | Entrada = pressão de venda; saída = acumulação (z-score em 1 ano). |
+| Saldo nas corretoras 30d | Coin Metrics (`SplyExNtv`) | 10% | Caindo = menos oferta. |
+| Endereços ativos | Coin Metrics (`AdrActCnt`) | 10% | Média de 30 dias contra a de 1 ano. |
+| Fear & Greed | Alternative.me | 15% | Leitura contrária. |
+| Juros do Fed | FRED `DFEDTARU` | 5% | Cortes em 90 dias = mais liquidez. |
+| Dólar | FRED `DTWEXBGS` (substituto gratuito do DXY) | 10% | Correlação inversa. |
+| Notícias 24h | Feeds RSS + **modelo local no Ollama** | 15% | Cada manchete classificada como alta, baixa ou neutra. |
+
+O nome do regime vem do MVRV Z-Score e do Fear & Greed. O viés (−1 a +1)
+entra no `/tendencia` com peso `regime_peso_tendencia`. O `/tendencia` também
+mostra 🚨 **extremos convergentes**: euforia + funding alto + RSI sobrecomprado,
+ou o inverso.
+
+**Ollama (opcional):** instale em ollama.com e baixe um modelo pequeno
+(`ollama pull qwen2.5:3b`). Sem ele, o item de notícias é ignorado e o resto funciona normalmente.
+
+**Atribuição obrigatória:** os dados da Coin Metrics Community estão sob
+**CC BY-NC 4.0** (uso não comercial), e o Fear & Greed exige citar a
+Alternative.me. O `/regime` já mostra as fontes.
 
 ### Como o `/tendencia` calcula
 
@@ -143,13 +179,18 @@ O comando soma fatores com pesos fixos, num *score* de −1 a +1:
 
 | Fator | Peso | Fonte |
 |---|---|---|
-| Tendência de cada intervalo (médias 20/50 + inclinação) | 35% | velas |
-| RSI (extremos contam contra: risco de correção ou repique) | 10% | velas |
-| Fluxo agressor: % do volume em compras a mercado, últimas 24 velas | 15% | velas (*taker buy volume*) |
-| Livro de ofertas: compra x venda até ±1% do preço | 15% | `/api/v3/depth` |
-| Open interest em 4h, combinado com a direção do preço | 10% | Futuros (público) |
-| Funding rate (extremos = sinal contrário) | 5% | Futuros (público) |
-| Proporção de contas long/short (extremos = sinal contrário) | 5% | Futuros (público) |
+| Tendência de cada intervalo (médias 20/50 + inclinação) | 30 | velas |
+| Regime diário (viés macro) | 20 | camada de regime |
+| Fluxo agressor: % do volume em compras a mercado, últimas 24 velas | 12 | velas (*taker buy volume*) |
+| EMAs 9/21/55/200 alinhadas | 10 | velas |
+| Livro de ofertas: compra x venda até ±1% do preço | 10 | `/api/v3/depth` |
+| RSI (extremos contam contra: risco de correção ou repique) | 10 | velas |
+| Open interest em 4h, combinado com a direção do preço | 8 | Futuros (público) |
+| Bandas de Bollinger 20/2 (fora da banda = esticado; *squeeze* informado) | 5 | velas |
+| Funding rate (extremos = sinal contrário) | 4 | Futuros (público) |
+| Proporção de contas long/short (extremos = sinal contrário) | 4 | Futuros (público) |
+
+Os pesos são relativos: o score é normalizado pela soma dos fatores disponíveis.
 
 Os alvos são o teto e o piso mais próximos no primeiro intervalo de `intervalos`.
 A chance de tocar cada lado primeiro parte da distância até eles (modelo de passeio
@@ -185,7 +226,7 @@ docs/comandos-externos.md   comandos quando o bot é compartilhado com outro pro
 ```
 
 Gerados durante a execução (ficam fora do git): `.env`, `config.json`,
-`estado.json` (o que já foi avisado, a pausa e as ordens em acompanhamento) e
+`estado.json` (o que já foi avisado, a pausa e as ordens em acompanhamento), `regime.json` (último regime e manchetes classificadas) e
 `monitor.log` (rotativo, até 4 × 5 MB).
 
 ## Segurança
