@@ -2412,8 +2412,8 @@ def main():
     state = load_state(state_path)
     notif = Notificador(cfg, state)
     notif.agenda = agenda = Agenda(cfg, state)
-    notif.config = Configurador(cfg, agenda, notif, cache)
     cache = {"validos": client.valid_symbols(cfg["moeda_cotacao"])}
+    notif.config = Configurador(cfg, agenda, notif, cache)
     log.info("Monitor iniciado (%s)", ", ".join(cfg["intervalos"]))
 
     ordens = MonitorOrdens(client, cfg, state, notif, cache) \
